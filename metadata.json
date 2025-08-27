@@ -1,0 +1,5 @@
+{
+  "name": "_to-logseq",
+  "description": "Upload multimedia content to transcribe and collate them into a logseq-friendly markdown page.",
+  "requestFramePermissions": []
+}
