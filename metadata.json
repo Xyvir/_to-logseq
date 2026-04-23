@@ -1,5 +1,6 @@
 {
-  "name": "_to-logseq",
-  "description": "Upload multimedia content to transcribe and collate them into a logseq-friendly markdown page.",
-  "requestFramePermissions": []
+  "name": "_to-lithic",
+  "description": "Upload multimedia content to transcribe and collate them into a Lithic-friendly Streams-node format.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
 }

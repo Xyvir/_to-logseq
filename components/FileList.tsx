@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { UploadedFile, ProcessingStatus } from '../types';
-import { FileAudioIcon, SpinnerIcon, CheckCircleIcon, XCircleIcon, DragHandleIcon, TrashIcon, FileImageIcon, FileTextIcon, FileVideoIcon } from './icons';
+import { FileAudioIcon, SpinnerIcon, CheckCircleIcon, XCircleIcon, DragHandleIcon, TrashIcon, FileImageIcon, FileTextIcon, FileVideoIcon, CropIcon } from './icons';
 
 interface FileListProps {
   files: UploadedFile[];
@@ -8,6 +8,9 @@ interface FileListProps {
   isProcessing: boolean;
   onRemoveMultiple: (ids: string[]) => void;
   onUpdateFile: (id: string, updates: Partial<UploadedFile>) => void;
+  selectedIds: Set<string>;
+  onSelectionChange: (ids: Set<string>) => void;
+  onOpenCropModal: (id: string) => void;
 }
 
 const StatusIndicator: React.FC<{ uploadedFile: UploadedFile }> = ({ uploadedFile }) => {
@@ -84,49 +87,87 @@ const ProcessingPreview: React.FC<{ uploadedFile: UploadedFile }> = ({ uploadedF
   );
 };
 
-const ImageFileDetails: React.FC<{ uploadedFile: UploadedFile; onUpdateFile: (id: string, updates: Partial<UploadedFile>) => void; isProcessing: boolean; }> = ({ uploadedFile, onUpdateFile, isProcessing }) => {
+const ImageFileDetails: React.FC<{ uploadedFile: UploadedFile; onUpdateFile: (id: string, updates: Partial<UploadedFile>) => void; isProcessing: boolean; onOpenCropModal: (id: string) => void; }> = ({ uploadedFile, onUpdateFile, isProcessing, onOpenCropModal }) => {
     const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+    const [previewSize, setPreviewSize] = useState<{ width: number, height: number } | null>(null);
 
     useEffect(() => {
         const url = URL.createObjectURL(uploadedFile.file);
         setThumbUrl(url);
+
+        const img = new Image();
+        img.onload = () => {
+            const width = img.naturalWidth / 2;
+            const height = img.naturalHeight / 2;
+            setPreviewSize({ width, height });
+        };
+        img.src = url;
+
         return () => URL.revokeObjectURL(url);
     }, [uploadedFile.file]);
 
     const handleImageTypeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         onUpdateFile(uploadedFile.id, { imageType: e.target.checked ? 'no-text' : 'text' });
     };
+    
+    const isCroppable = uploadedFile.status === ProcessingStatus.PENDING && !isProcessing;
 
     return (
         <div className="flex items-center space-x-4 flex-1 min-w-0">
-            {thumbUrl ? (
-                <img src={thumbUrl} alt={uploadedFile.file.name} className="w-12 h-12 rounded-md object-cover flex-shrink-0 bg-slate-700"/>
-            ) : (
-                <div className="w-12 h-12 rounded-md flex-shrink-0 bg-slate-700 flex items-center justify-center">
-                    <FileImageIcon className="w-6 h-6 text-slate-400" />
-                </div>
-            )}
+            <div className="relative group flex-shrink-0">
+                {thumbUrl ? (
+                    <img src={thumbUrl} alt={uploadedFile.file.name} className="w-12 h-12 rounded-md object-cover bg-slate-700"/>
+                ) : (
+                    <div className="w-12 h-12 rounded-md bg-slate-700 flex items-center justify-center">
+                        <FileImageIcon className="w-6 h-6 text-slate-400" />
+                    </div>
+                )}
+                {/* --- Tooltip --- */}
+                {thumbUrl && previewSize && (
+                    <div className="absolute bottom-0 left-full ml-4 p-1.5 bg-slate-900/80 backdrop-blur-sm border border-slate-600 rounded-lg shadow-2xl 
+                                   invisible opacity-0 group-hover:visible group-hover:opacity-100 transition-all duration-150 z-20
+                                   transform group-hover:scale-100 scale-95 origin-bottom-left w-max">
+                        <img 
+                            src={thumbUrl} 
+                            alt={`${uploadedFile.file.name} preview`} 
+                            className="rounded"
+                            style={{ width: `${previewSize.width}px`, height: `${previewSize.height}px` }}
+                        />
+                    </div>
+                )}
+            </div>
+            
             <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium text-slate-200 truncate" title={uploadedFile.file.name}>
                     {uploadedFile.file.name}
                 </p>
-                {uploadedFile.status === ProcessingStatus.PENDING && !isProcessing && (
-                    <div className="flex items-center mt-1.5">
-                    {uploadedFile.imageAnalysisStatus === 'PENDING' && <SpinnerIcon className="w-4 h-4 mr-2 text-slate-400" />}
-                    {uploadedFile.imageAnalysisStatus === 'DONE' && (
-                        <>
-                            <input
-                                id={`no-text-checkbox-${uploadedFile.id}`}
-                                type="checkbox"
-                                checked={uploadedFile.imageType === 'no-text'}
-                                onChange={handleImageTypeChange}
-                                className="h-4 w-4 rounded bg-slate-700 border-slate-500 text-indigo-500 focus:ring-indigo-600 focus:ring-offset-slate-800"
-                                aria-label="Mark image as containing no significant text"
-                            />
-                            <label htmlFor={`no-text-checkbox-${uploadedFile.id}`} className="ml-2 text-xs text-slate-300 select-none">No Text</label>
-                        </>
-                    )}
-                    {uploadedFile.imageAnalysisStatus === 'ERROR' && <p className="text-xs text-red-400">Analysis failed</p>}
+                {isCroppable && (
+                    <div className="flex items-center mt-1.5 space-x-4">
+                        {uploadedFile.imageAnalysisStatus === 'PENDING' && <SpinnerIcon className="w-4 h-4 mr-2 text-slate-400" />}
+                        {uploadedFile.imageAnalysisStatus === 'DONE' && (
+                            <>
+                                <div className="flex items-center">
+                                    <input
+                                        id={`no-text-checkbox-${uploadedFile.id}`}
+                                        type="checkbox"
+                                        checked={uploadedFile.imageType === 'no-text'}
+                                        onChange={handleImageTypeChange}
+                                        className="h-4 w-4 rounded bg-slate-700 border-slate-500 text-indigo-500 focus:ring-indigo-600 focus:ring-offset-slate-800"
+                                        aria-label="Mark image as containing no significant text"
+                                    />
+                                    <label htmlFor={`no-text-checkbox-${uploadedFile.id}`} className="ml-2 text-xs text-slate-300 select-none">No Text</label>
+                                </div>
+                                <button
+                                    onClick={() => onOpenCropModal(uploadedFile.id)}
+                                    className="flex items-center text-xs text-slate-400 hover:text-indigo-400 transition-colors"
+                                    title="Manually crop this image"
+                                >
+                                    <CropIcon className="w-4 h-4 mr-1.5" />
+                                    Crop
+                                </button>
+                            </>
+                        )}
+                        {uploadedFile.imageAnalysisStatus === 'ERROR' && <p className="text-xs text-red-400">Analysis failed</p>}
                     </div>
                 )}
                  {uploadedFile.status === ProcessingStatus.PROCESSING && (
@@ -166,35 +207,56 @@ const AudioFileDetails: React.FC<{ uploadedFile: UploadedFile }> = ({ uploadedFi
     );
 };
 
-const TextFileDetails: React.FC<{ uploadedFile: UploadedFile }> = ({ uploadedFile }) => (
-    <div className="flex items-center space-x-4 flex-1 min-w-0">
-        <FileTextIcon className="w-6 h-6 text-slate-400 flex-shrink-0" />
-        <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium text-slate-200 truncate" title={uploadedFile.file.name}>
-                {uploadedFile.file.name}
-            </p>
-            {uploadedFile.status === ProcessingStatus.PROCESSING && (
-                 <p className="text-xs text-slate-400 mt-1">Processing...</p>
-            )}
-            {uploadedFile.status === ProcessingStatus.ERROR && (
-                <p className="text-xs text-red-400 mt-1 break-words" title={uploadedFile.error}>{uploadedFile.error}</p>
-            )}
+const TextFileDetails: React.FC<{ uploadedFile: UploadedFile }> = ({ uploadedFile }) => {
+    const [textContent, setTextContent] = useState<string | null>(null);
+
+    useEffect(() => {
+        uploadedFile.file.text()
+            .then(text => {
+                const previewText = text.length > 5000 ? text.substring(0, 5000) + "\n\n... (file truncated for preview)" : text;
+                setTextContent(previewText);
+            })
+            .catch(() => {
+                setTextContent("Could not read file content for preview.");
+            });
+    }, [uploadedFile.file]);
+
+    return (
+        <div className="flex items-center space-x-4 flex-1 min-w-0">
+            <div className="relative group flex-shrink-0">
+                <FileTextIcon className="w-6 h-6 text-slate-400" />
+                {/* --- Tooltip Preview --- */}
+                {textContent && (
+                    <div className="absolute bottom-0 left-full ml-4 p-2 bg-slate-900/80 backdrop-blur-sm border border-slate-600 rounded-lg shadow-2xl 
+                                  invisible opacity-0 group-hover:visible group-hover:opacity-100 transition-all duration-150 z-20
+                                  transform group-hover:scale-100 scale-95 origin-bottom-left w-max max-w-sm">
+                        <pre className="text-xs text-slate-300 font-mono whitespace-pre-wrap max-h-60 overflow-y-auto p-1">
+                            <code>{textContent}</code>
+                        </pre>
+                    </div>
+                )}
+            </div>
+
+            <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-slate-200 truncate" title={uploadedFile.originalFileName || uploadedFile.file.name}>
+                    {uploadedFile.originalFileName || uploadedFile.file.name}
+                </p>
+                {uploadedFile.status === ProcessingStatus.PROCESSING && (
+                    <p className="text-xs text-slate-400 mt-1">Processing...</p>
+                )}
+                {uploadedFile.status === ProcessingStatus.ERROR && (
+                    <p className="text-xs text-red-400 mt-1 break-words" title={uploadedFile.error}>{uploadedFile.error}</p>
+                )}
+            </div>
         </div>
-    </div>
-);
+    );
+};
 
 
-const FileList: React.FC<FileListProps> = ({ files, onReorder, isProcessing, onRemoveMultiple, onUpdateFile }) => {
+const FileList: React.FC<FileListProps> = ({ files, onReorder, isProcessing, onRemoveMultiple, onUpdateFile, selectedIds, onSelectionChange, onOpenCropModal }) => {
   const dragItem = useRef<string | null>(null);
   const dragOverItem = useRef<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-
-  useEffect(() => {
-    if (isProcessing) {
-      setSelectedIds(new Set());
-    }
-  }, [isProcessing]);
 
   const handleDragStart = (e: React.DragEvent<HTMLLIElement>, id: string) => {
     dragItem.current = id;
@@ -227,21 +289,19 @@ const FileList: React.FC<FileListProps> = ({ files, onReorder, isProcessing, onR
   };
   
   const handleToggleSelect = (id: string) => {
-    setSelectedIds(prev => {
-        const newSet = new Set(prev);
-        if (newSet.has(id)) {
-            newSet.delete(id);
-        } else {
-            newSet.add(id);
-        }
-        return newSet;
-    });
+    const newSet = new Set(selectedIds);
+    if (newSet.has(id)) {
+        newSet.delete(id);
+    } else {
+        newSet.add(id);
+    }
+    onSelectionChange(newSet);
   };
 
   const handleDeleteSelected = () => {
       if (selectedIds.size > 0) {
           onRemoveMultiple(Array.from(selectedIds));
-          setSelectedIds(new Set());
+          onSelectionChange(new Set());
       }
   };
 
@@ -292,7 +352,7 @@ const FileList: React.FC<FileListProps> = ({ files, onReorder, isProcessing, onR
                             case 'audio':
                                 return <AudioFileDetails uploadedFile={uploadedFile} />;
                             case 'image':
-                                return <ImageFileDetails uploadedFile={uploadedFile} onUpdateFile={onUpdateFile} isProcessing={isProcessing} />;
+                                return <ImageFileDetails uploadedFile={uploadedFile} onUpdateFile={onUpdateFile} isProcessing={isProcessing} onOpenCropModal={onOpenCropModal} />;
                             case 'text':
                                 return <TextFileDetails uploadedFile={uploadedFile} />;
                             default:

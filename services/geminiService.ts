@@ -60,52 +60,237 @@ const cropImage = (
   });
 };
 
-export const classifyImageType = async (file: File): Promise<'text' | 'no-text'> => {
-  if (!process.env.API_KEY) {
-    throw new Error("API_KEY environment variable not set");
-  }
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const base64Image = await fileToBase64(file);
+export const cropImageFile = (
+  file: File,
+  cropBox: { x: number; y: number; width: number; height: number }
+): Promise<File> => {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
 
-  apiUsageTracker.incrementRequests();
-  const response = await ai.models.generateContent({
-    model: 'gemini-2.5-flash',
-    contents: [{
-      parts: [
-        { text: "Analyze the image. Does it primarily contain a significant amount of text (e.g., a document, a screenshot with lots of text, a presentation slide), or is it mostly a photograph or illustration with little to no text? Respond with only the word 'text' or 'no-text'." },
-        { inlineData: { mimeType: file.type, data: base64Image } }
-      ]
-    }]
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      
+      if (cropBox.width <= 0 || cropBox.height <= 0) {
+        return reject(new Error('Crop dimensions must be positive'));
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = cropBox.width;
+      canvas.height = cropBox.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return reject(new Error('Could not get canvas context'));
+
+      ctx.drawImage(
+        img, 
+        cropBox.x, 
+        cropBox.y, 
+        cropBox.width, 
+        cropBox.height, 
+        0, 0, 
+        cropBox.width, 
+        cropBox.height
+      );
+      
+      canvas.toBlob(blob => {
+        if (!blob) return reject(new Error('Failed to create blob from canvas'));
+        // Preserve original filename, but it will have new data and size
+        const croppedFile = new File([blob], file.name, { type: file.type, lastModified: Date.now() });
+        resolve(croppedFile);
+      }, file.type);
+    };
+
+    img.onerror = (err) => {
+      URL.revokeObjectURL(objectUrl);
+      reject(err instanceof ErrorEvent ? err.error : new Error(`Image loading failed: ${err}`));
+    };
+
+    img.src = objectUrl;
   });
-  
-  const result = response.text.trim().toLowerCase();
-  if (result === 'text') {
-    return 'text';
-  }
-  return 'no-text';
 };
 
-export const isKeyframe = async (file: File): Promise<boolean> => {
-    if (!process.env.API_KEY) {
-      throw new Error("API_KEY environment variable not set");
-    }
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const base64Image = await fileToBase64(file);
-  
-    apiUsageTracker.incrementRequests();
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: [{
-        parts: [
-          { text: "Analyze the image. Is this a slide, diagram, chart, or a screen with significant text that looks like a key point in a presentation or tutorial? Or is it a person talking, a landscape, or a dynamic scene from a video? Respond with only the word 'keyframe' or 'not-keyframe'." },
-          { inlineData: { mimeType: file.type, data: base64Image } }
-        ]
-      }]
+
+export const sliceImageHorizontally = async (
+    file: File,
+    minGapHeight: number = 10,   // Min height of a white gap to be considered a separator
+    whitespaceThreshold: number = 0, // Number of content pixels per row to be considered "whitespace"
+): Promise<File[]> => {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        const objectUrl = URL.createObjectURL(file);
+
+        img.onload = async () => {
+            URL.revokeObjectURL(objectUrl);
+
+            // If the image is too small vertically, don't bother chunking it.
+            if (img.height < 300) {
+                return resolve([file]);
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            if (!ctx) return reject(new Error('Could not get canvas context'));
+
+            ctx.drawImage(img, 0, 0);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+
+            // 1. Create Vertical Projection Profile
+            const verticalProjection = new Array(canvas.height).fill(0);
+            for (let y = 0; y < canvas.height; y++) {
+                let contentPixels = 0;
+                for (let x = 0; x < canvas.width; x++) {
+                    const i = (y * canvas.width + x) * 4;
+                    // Consider a pixel as content if it's not almost white.
+                    // A simple brightness check is effective. (R+G+B)/3 < threshold
+                    const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3;
+                    if (brightness < 250) { // Not white
+                        contentPixels++;
+                    }
+                }
+                verticalProjection[y] = contentPixels;
+            }
+
+            // 2. Identify significant whitespace gaps
+            const gaps: { start: number, end: number }[] = [];
+            let inGap = false;
+            let gapStart = 0;
+            for (let y = 0; y < canvas.height; y++) {
+                if (verticalProjection[y] <= whitespaceThreshold && !inGap) {
+                    inGap = true;
+                    gapStart = y;
+                } else if (verticalProjection[y] > whitespaceThreshold && inGap) {
+                    inGap = false;
+                    const gapHeight = y - gapStart;
+                    if (gapHeight >= minGapHeight) {
+                        gaps.push({ start: gapStart, end: y });
+                    }
+                }
+            }
+            if (inGap && (canvas.height - gapStart) >= minGapHeight) {
+                gaps.push({ start: gapStart, end: canvas.height });
+            }
+
+            if (gaps.length === 0) {
+                return resolve([file]);
+            }
+
+            // 3. Define initial content slices based on the gaps
+            const initialSlices: { start: number, end: number }[] = [];
+            let lastY = 0;
+            for (const gap of gaps) {
+                if (gap.start > lastY) {
+                    initialSlices.push({ start: lastY, end: gap.start });
+                }
+                lastY = gap.end;
+            }
+            if (canvas.height > lastY) {
+                initialSlices.push({ start: lastY, end: canvas.height });
+            }
+            
+            if (initialSlices.length <= 1) {
+                return resolve([file]);
+            }
+
+            // 3a. Merge small contiguous slices
+            const minSliceHeight = canvas.height * 0.10; // 10% of total height
+            const mergedSlices: { start: number, end: number }[] = [];
+            let currentMergeGroupStart = -1;
+            let currentMergeGroupEnd = -1;
+
+            for (let i = 0; i < initialSlices.length; i++) {
+                const slice = initialSlices[i];
+                const sliceHeight = slice.end - slice.start;
+
+                if (sliceHeight < minSliceHeight) {
+                    // This is a small slice, add it to the current group
+                    if (currentMergeGroupStart === -1) {
+                        currentMergeGroupStart = slice.start; // Start a new group
+                    }
+                    currentMergeGroupEnd = slice.end; // Extend the group
+                } else {
+                    // This is a large slice.
+                    // First, finalize any pending small group.
+                    if (currentMergeGroupStart !== -1) {
+                        mergedSlices.push({ start: currentMergeGroupStart, end: currentMergeGroupEnd });
+                        currentMergeGroupStart = -1;
+                        currentMergeGroupEnd = -1;
+                    }
+                    // Then, add the large slice itself.
+                    mergedSlices.push(slice);
+                }
+            }
+
+            // After the loop, check if there's a pending group to finalize.
+            if (currentMergeGroupStart !== -1) {
+                mergedSlices.push({ start: currentMergeGroupStart, end: currentMergeGroupEnd });
+            }
+            
+            // If the very last slice is too small, merge it with the previous one.
+            if (mergedSlices.length > 1) {
+                const lastSlice = mergedSlices[mergedSlices.length - 1];
+                const lastSliceHeight = lastSlice.end - lastSlice.start;
+                if (lastSliceHeight < minSliceHeight) {
+                    const previousSlice = mergedSlices[mergedSlices.length - 2];
+                    previousSlice.end = lastSlice.end; // Extend the previous slice to cover the last one
+                    mergedSlices.pop(); // Remove the small last slice
+                }
+            }
+            
+            const slices = mergedSlices;
+
+            if (slices.length <= 1) {
+                return resolve([file]);
+            }
+
+            // 4. Crop the original canvas into new files
+            const sliceToBlob = (sliceCanvas: HTMLCanvasElement): Promise<Blob> => {
+                return new Promise(blobResolve => {
+                    sliceCanvas.toBlob(blob => {
+                        if (blob) blobResolve(blob);
+                        else reject(new Error("Failed to create blob from canvas"));
+                    }, file.type);
+                });
+            };
+
+            const blobs: Blob[] = [];
+            const bleed = 20; // Add 20px bleed/margin
+            for (const slice of slices) {
+                const startY = Math.max(0, slice.start - bleed);
+                const endY = Math.min(canvas.height, slice.end + bleed);
+                const height = endY - startY;
+
+                if (height <= 0) continue;
+
+                const sliceCanvas = document.createElement('canvas');
+                sliceCanvas.width = canvas.width;
+                sliceCanvas.height = height;
+                const sliceCtx = sliceCanvas.getContext('2d');
+                if (!sliceCtx) continue;
+
+                sliceCtx.drawImage(canvas, 0, startY, canvas.width, height, 0, 0, canvas.width, height);
+                blobs.push(await sliceToBlob(sliceCanvas));
+            }
+            
+            const originalName = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
+            const fileExt = file.name.split('.').pop() || 'png';
+
+            const slicedFiles = blobs.map((blob, index) => {
+                return new File([blob], `${originalName}-slice${index + 1}.${fileExt}`, { type: file.type });
+            });
+
+            resolve(slicedFiles.length > 0 ? slicedFiles : [file]);
+        };
+
+        img.onerror = (err) => {
+            URL.revokeObjectURL(objectUrl);
+            reject(err);
+        };
+        img.src = objectUrl;
     });
-    
-    const result = response.text.trim().toLowerCase();
-    return result === 'keyframe';
-  };
+};
 
 export const processImage = async (
   file: File, 
@@ -120,36 +305,28 @@ export const processImage = async (
   const originalName = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
 
   if (imageType === 'no-text') {
-    apiUsageTracker.incrementRequests();
-    const responseStream = await ai.models.generateContentStream({
-      model: 'gemini-2.5-flash',
-      contents: [{
-        parts: [
-          { text: "You are an expert at describing images. Provide a detailed description of the following image." },
-          { inlineData: { mimeType: file.type, data: base64Image } }
-        ]
-      }]
-    });
+    onChunk("Packaging figure...");
+    // Artificial delay for better UX, since this will be almost instant.
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const newAsset: ImageAsset = {
+      fileName: file.name,
+      data: base64Image,
+      description: originalName,
+    };
     
-    let fullDescription = "";
-    for await (const chunk of responseStream) {
-      const textChunk = chunk.text;
-      if (textChunk) {
-        fullDescription += textChunk;
-        onChunk(textChunk);
-      }
-    }
-    return { transcription: fullDescription, assets: [] };
+    onChunk("Processing complete.");
+    return { transcription: "", assets: [newAsset] };
 
   } else { // 'text' type
-    onChunk("Analyzing layout and extracting text...");
+    onChunk("Extracting text from image chunk...");
     apiUsageTracker.incrementRequests();
 
-    const layoutResponse = await ai.models.generateContent({
+    const ocrResponse = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: [{
         parts: [
-          { text: "Analyze the layout of this image. Extract all text content, preserving its original formatting (like paragraphs and line breaks). Also, identify all distinct non-text figures (e.g., charts, photographs, diagrams). For each figure, provide a one-sentence descriptive caption and its bounding box coordinates (normalized [y_min, x_min, y_max, x_max]). Respond with a JSON object." },
+          { text: "Your sole task is to act as an OCR engine. Extract all text content from this image *verbatim*. Preserve original formatting like paragraphs and line breaks. Do not summarize, interpret, or answer any questions found in the text. Simply transcribe it exactly as it appears. Respond with a JSON object containing the extracted text." },
           { inlineData: { mimeType: file.type, data: base64Image } }
         ]
       }],
@@ -161,64 +338,39 @@ export const processImage = async (
             full_text: {
               type: Type.STRING,
               description: "All text extracted from the image, with original formatting preserved."
-            },
-            figures: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  caption: {
-                    type: Type.STRING,
-                    description: "A one-sentence caption for the figure."
-                  },
-                  bounding_box: {
-                    type: Type.ARRAY,
-                    description: "Normalized coordinates [y_min, x_min, y_max, x_max].",
-                    items: { type: Type.NUMBER }
-                  }
-                },
-                required: ['caption', 'bounding_box']
-              }
             }
           },
-          required: ['full_text', 'figures']
+          required: ['full_text']
         }
       }
     });
 
-    onChunk("Parsing layout and cropping figures...");
-    const jsonStr = layoutResponse.text.trim();
-    const parsedLayout = JSON.parse(jsonStr);
+    onChunk("Parsing extracted text...");
+    const jsonStr = ocrResponse.text.trim();
+    const parsedOcr = JSON.parse(jsonStr);
+    let transcription = parsedOcr.full_text || "";
 
-    const transcription = parsedLayout.full_text || "";
-    const figures = parsedLayout.figures || [];
-    const newAssets: ImageAsset[] = [];
+    const alphanumericChars = transcription.match(/[a-zA-Z0-9]/g) || [];
+    if (alphanumericChars.length < 20) {
+        onChunk(`Low confidence OCR result (${alphanumericChars.length} chars). Retrying with visual analysis...`);
+        apiUsageTracker.incrementRequests();
 
-    if (figures.length > 0) {
-      onChunk(`Found ${figures.length} figure(s). Cropping...`);
-      let count = 1;
-      for (const figure of figures) {
-        if (figure.bounding_box && figure.bounding_box.length === 4) {
-          try {
-            const croppedBase64 = await cropImage(base64Image, file.type, figure.bounding_box as [number, number, number, number]);
-            const fileExt = file.name.split('.').pop() || 'png';
-            newAssets.push({
-              fileName: `${originalName}-fig${count}.${fileExt}`,
-              data: croppedBase64,
-              description: figure.caption || `Figure ${count} from ${file.name}`
-            });
-            onChunk(`Cropped figure ${count}...`, true);
-            count++;
-          } catch (e) {
-            console.error("Failed to crop image figure:", e);
-            onChunk(`Failed to crop figure ${count}.`, true);
-          }
-        }
-      }
+        const analysisResponse = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: [{
+                parts: [
+                    { text: "Analyze this image and describe its content. Your primary goal is to provide a verbatim transcription of any visible text. This includes characters, symbols, handwriting, or mathematical equations. If there are questions, transcribe them exactly as they are written; do not answer them. If the image contains a diagram or figure, describe it clearly. Provide the description as plain text." },
+                    { inlineData: { mimeType: file.type, data: base64Image } }
+                ]
+            }],
+        });
+        
+        transcription = analysisResponse.text.trim();
+        onChunk("Visual analysis complete.");
     }
 
     onChunk("Processing complete.");
-    return { transcription, assets: newAssets };
+    return { transcription, assets: [] };
   }
 };
 
@@ -246,7 +398,7 @@ export const transcribeAudioStream = async (
           model: 'gemini-2.5-flash',
           contents: [{ 
               parts: [
-                  { text: "You are an expert audio transcriptionist. Transcribe the following audio file. Provide a clean and accurate transcription. Separate distinct paragraphs with a double newline." },
+                  { text: "You are an expert audio transcriptionist. Your single responsibility is to transcribe the following audio file verbatim. Provide a clean and accurate transcription. If there are questions in the audio, transcribe the questions as spoken; do not answer them. Do not add any extra information, summaries, or interpretations. Separate distinct paragraphs with a double newline." },
                   { 
                       inlineData: { 
                           mimeType: file.type, 
@@ -281,4 +433,68 @@ export const transcribeAudioStream = async (
     throw new Error(`Failed to transcribe after ${maxRetries + 1} attempts: ${lastError.message}`);
   }
   throw new Error("An unknown error occurred during transcription.");
+};
+
+export const refineMarkdownStream = async (
+    markdownContent: string,
+    onChunk: (chunk: string) => void
+): Promise<string> => {
+    if (!process.env.API_KEY) {
+        throw new Error("API_KEY environment variable not set");
+    }
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    apiUsageTracker.incrementRequests();
+
+    const prompt = `
+You are an expert editor specializing in creating hierarchical notes for TiddlyWiki using the Streams plugin (Lithic format).
+Your task is to refine the provided raw text, which is a collation of transcriptions and notes, into a structured document using markdown headers for hierarchy.
+
+**Formatting Instructions:**
+
+1.  **Hierarchy and Structure:**
+    *   **Document Title (H1):** The very first line must be an H1 header representing the main topic or source.
+        *   Example: \`# Project Overview\`
+    *   **Chapters/Sections (H2):** Divide the content into logical sections or chapters using H2 headers. These will become "Parent Nodes" in the Streams format.
+        *   Example: \`## Introduction\`
+    *   **Pages/Key Points (H3):** Within each chapter, break down details into H3 headers. Each H3 will become a "Child Node" (Page) in the Streams format.
+        *   Example: \`### Key Objectives\`
+    *   **Body Content:** The content within each H3 node should be well-formatted text. Use bullet points only for actual lists of items, not for the entire structure.
+
+2.  **Content and Details:**
+    *   Improve readability by correcting grammar, spelling, and punctuation.
+    *   Do **not** paraphrase, summarize, or alter the original meaning.
+    *   Preserve any questions found in the text *exactly as they are*.
+    *   Merge fragmented ideas into coherent paragraphs or lists within their respective sections.
+
+3.  **Mathematical Equations (KaTeX):**
+    *   For **inline** mathematical equations, wrap them in single dollar signs: \`$E = mc^2$\`.
+    *   For **block-level** equations, wrap them in double dollar signs on their own lines.
+
+4.  **Preserve Image Links:**
+    *   Do **NOT** alter any markdown image links (e.g., \`![description](assets/filename.png)\`). They must be preserved exactly as they are.
+
+5.  **Output:**
+    *   Return only the refined markdown content with H1, H2, and H3 headers. Do not include any preambles, apologies, or explanations.
+
+**Raw Content to Refine:**
+---
+${markdownContent}
+---
+`;
+
+    const responseStream = await ai.models.generateContentStream({
+        model: 'gemini-2.5-flash',
+        contents: [{ parts: [{ text: prompt }] }],
+    });
+
+    let fullText = "";
+    for await (const chunk of responseStream) {
+        const textChunk = chunk.text;
+        if (textChunk) {
+            fullText += textChunk;
+            onChunk(textChunk);
+        }
+    }
+
+    return fullText.trim();
 };

@@ -5,31 +5,39 @@ import { ImageAsset } from '../types';
 
 interface ResultPreviewProps {
   markdown: string;
+  lithicContent: string;
   assets: ImageAsset[];
   onDownload: () => void;
   onClear: () => void;
   onReprocess: () => void;
   filename: string;
   onFilenameChange: (newFilename: string) => void;
+  rawMarkdown: string;
+  onDownloadRaw: () => void;
 }
 
 const ResultPreview: React.FC<ResultPreviewProps> = ({
   markdown,
+  lithicContent,
   assets,
   onDownload,
   onClear,
   onReprocess,
   filename,
   onFilenameChange,
+  rawMarkdown,
+  onDownloadRaw,
 }) => {
   const [isCopied, setIsCopied] = useState(false);
+  const [showLithic, setShowLithic] = useState(true);
   
   if (!markdown) {
     return null;
   }
   
   const handleCopyToClipboard = () => {
-    navigator.clipboard.writeText(markdown).then(() => {
+    const textToCopy = showLithic ? lithicContent : markdown;
+    navigator.clipboard.writeText(textToCopy).then(() => {
       setIsCopied(true);
       setTimeout(() => setIsCopied(false), 2000);
     }).catch(err => {
@@ -75,6 +83,15 @@ const ResultPreview: React.FC<ResultPreviewProps> = ({
                 <ClipboardIcon className="w-5 h-5 mr-2" />
                 {isCopied ? 'Copied!' : 'Copy'}
             </button>
+            {rawMarkdown && (
+              <button
+                onClick={onDownloadRaw}
+                className="px-3 py-2 text-xs font-medium text-slate-400 bg-slate-700 rounded-md hover:bg-slate-600 hover:text-slate-300 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-indigo-500"
+                title="Download the raw, pre-refinement markdown file for debugging."
+              >
+                Download Debug MD
+              </button>
+            )}
             <button
               onClick={onReprocess}
               className="px-4 py-2 text-sm font-medium text-slate-300 bg-slate-700 rounded-md hover:bg-slate-600 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-indigo-500"
@@ -90,7 +107,22 @@ const ResultPreview: React.FC<ResultPreviewProps> = ({
         </div>
       </div>
 
-      <div className="bg-slate-800 p-4 rounded-lg mb-4 flex flex-col sm:flex-row items-stretch sm:items-center gap-4">
+      <div className="flex space-x-1 mb-2">
+        <button
+          onClick={() => setShowLithic(true)}
+          className={`px-4 py-2 text-xs font-medium rounded-t-lg transition-colors ${showLithic ? 'bg-slate-800 text-indigo-400 border-t border-x border-slate-700' : 'bg-transparent text-slate-500 hover:text-slate-300'}`}
+        >
+          Lithic (.lith)
+        </button>
+        <button
+          onClick={() => setShowLithic(false)}
+          className={`px-4 py-2 text-xs font-medium rounded-t-lg transition-colors ${!showLithic ? 'bg-slate-800 text-indigo-400 border-t border-x border-slate-700' : 'bg-transparent text-slate-500 hover:text-slate-300'}`}
+        >
+          Raw Markdown
+        </button>
+      </div>
+
+      <div className="bg-slate-800 p-4 rounded-lg rounded-tl-none mb-4 flex flex-col sm:flex-row items-stretch sm:items-center gap-4">
         <div className="flex-grow">
           <label htmlFor="filename-input" className="text-sm font-medium text-slate-400">Filename</label>
           <div className="flex rounded-md shadow-sm mt-1">
@@ -103,7 +135,7 @@ const ResultPreview: React.FC<ResultPreviewProps> = ({
               placeholder="processing-title"
             />
             <span className="inline-flex items-center px-3 rounded-r-md border border-l-0 border-slate-600 bg-slate-600 text-slate-300 text-sm">
-              .md
+              .lith (Monolith)
             </span>
           </div>
         </div>
@@ -122,13 +154,13 @@ const ResultPreview: React.FC<ResultPreviewProps> = ({
               className="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-white bg-indigo-600 border border-transparent rounded-md shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-indigo-500 h-10"
             >
               <DownloadIcon className="w-5 h-5 mr-2" />
-              Download Markdown
+              Download Lithic
             </button>
         </div>
       </div>
 
       <pre className="bg-slate-800 p-4 rounded-lg text-sm text-slate-300 max-h-96 overflow-y-auto whitespace-pre-wrap font-mono">
-        <code>{markdown}</code>
+        <code>{showLithic ? lithicContent : markdown}</code>
       </pre>
     </div>
   );

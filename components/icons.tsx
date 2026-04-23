@@ -73,3 +73,10 @@ export const ClipboardIcon = ({ className }: { className?: string }) => (
         <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 7.5V6.108c0-1.135.845-2.098 1.976-2.192.373-.03.748-.03 1.125 0 1.13.094 1.976 1.057 1.976 2.192V7.5M8.25 7.5h7.5M8.25 7.5h-1.5a1.5 1.5 0 00-1.5 1.5v11.25c0 .828.672 1.5 1.5 1.5h12a1.5 1.5 0 001.5-1.5V9a1.5 1.5 0 00-1.5-1.5h-1.5m-7.5 4.5h7.5m-7.5 3h7.5" />
     </svg>
 );
+
+export const CropIcon = ({ className }: { className?: string }) => (
+    <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" d="M6 21V7.5A1.5 1.5 0 017.5 6h10.5" />
+        <path strokeLinecap="round" strokeLinejoin="round" d="M18 3v10.5A1.5 1.5 0 0116.5 15H3" />
+    </svg>
+);

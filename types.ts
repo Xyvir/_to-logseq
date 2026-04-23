@@ -34,4 +34,7 @@ export interface UploadedFile {
   imageAnalysisStatus?: 'PENDING' | 'DONE' | 'ERROR';
   imageType?: 'text' | 'no-text';
   assets?: ImageAsset[];
+
+  // For pre-selection
+  preselectedForDeletion?: boolean;
 }

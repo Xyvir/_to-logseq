@@ -2,7 +2,7 @@ import React from 'react';
 import { UploadIcon } from './icons';
 
 interface FileUploadProps {
-  onFilesSelected: (files: FileList | null) => void;
+  onFilesSelected: (files: FileList | File[] | null) => void;
   disabled: boolean;
 }
 
@@ -68,17 +68,16 @@ const FileUpload: React.FC<FileUploadProps> = ({ onFilesSelected, disabled }) =>
       >
         <div className={`flex flex-col items-center justify-center pt-5 pb-6 ${disabled ? 'text-slate-500' : 'text-slate-400'}`}>
           <UploadIcon className="w-10 h-10 mb-3" />
-          <p className="mb-2 text-sm"><span className={`font-semibold ${!disabled ? 'text-indigo-400' : ''}`}>Click to upload</span> or drag and drop</p>
-          <p className="text-xs">MP3, WAV, MP4, MOV, PNG, JPG, PDF, TXT, MD, etc.</p>
-          <p className="text-xs text-slate-500 mt-1">(Audio/Video is limited to 2 GB per file)</p>
-          <p className="text-xs text-slate-500 mt-1">(You can save time by prepocessing spoken audio to 3x speed.)</p>
+          <p className="mb-2 text-sm"><span className={`font-semibold ${!disabled ? 'text-indigo-400' : ''}`}>Click to upload</span>, drag & drop, or paste</p>
+          <p className="text-xs">MP3, WAV, PNG, JPG, PDF, TXT, MD, HTML, DOCX, EPUB, etc.</p>
+          <p className="text-xs text-slate-500 mt-1">(Large files are limited to 2 GB)</p>
         </div>
         <input
           ref={fileInputRef}
           id="file-upload"
           type="file"
           multiple
-          accept="audio/*,image/*,video/*,text/plain,.md,.txt,application/pdf"
+          accept="audio/*,image/*,text/plain,.md,.txt,application/pdf,text/html,.html,.htm,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx,application/epub+zip,.epub"
           className="opacity-0 absolute inset-0 w-full h-full"
           onChange={handleFileChange}
           disabled={disabled}

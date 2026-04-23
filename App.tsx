@@ -1,16 +1,22 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { UploadedFile, ProcessingStatus, ImageAsset } from './types';
-import { transcribeAudioStream, classifyImageType, processImage } from './services/geminiService';
+import { transcribeAudioStream, processImage, sliceImageHorizontally, refineMarkdownStream, cropImageFile } from './services/geminiService';
+import { parseMarkdownToLithic } from './services/lithicService';
 import { processPdfFile } from './services/pdfService';
-import { processVideoFile } from './services/videoService';
+import { convertPdfToDocx } from './services/pdfConverterService';
+import { processEpubFile } from './services/epubService';
 import { chunkAudioFile } from './services/audioService';
 import FileUpload from './components/FileUpload';
 import FileList from './components/FileList';
 import ResultPreview from './components/TranscriptionPreview';
 import ProcessingLog from './components/ProcessingLog';
 import ApiUsageCounter from './components/ApiUsageCounter';
+import RefinementPreview from './components/RefinementPreview';
+import ManualCropModal from './components/ManualCropModal';
+import ConfirmationModal from './components/ConfirmationModal';
 import { SpinnerIcon } from './components/icons';
 import JSZip from 'jszip';
+import mammoth from 'mammoth';
 
 
 // --- React Component ---
@@ -35,20 +41,122 @@ const calculateTotalSize = (files: UploadedFile[]): number => {
     return total;
 };
 
+const processDocxFile = async (
+    docxFile: File,
+    fileId: string,
+    addLog: (message: string, replaceLast?: boolean) => void
+): Promise<UploadedFile[]> => {
+    const newFilesToQueue: UploadedFile[] = [];
+    addLog(`[${docxFile.name}] Deconstructing DOCX file...`);
+    
+    const arrayBuffer = await docxFile.arrayBuffer();
+    
+    const images: { data: string, contentType: string }[] = [];
+    const imageConverterOptions = {
+        convertImage: mammoth.images.inline((element: any) => {
+            const index = images.length;
+            return element.read("base64").then((imageBuffer: string) => {
+                images.push({ data: imageBuffer, contentType: element.contentType });
+                return {
+                    src: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+                    'data-image-index': index.toString()
+                };
+            });
+        })
+    };
+    
+    const { value: html } = await mammoth.convertToHtml({ arrayBuffer }, imageConverterOptions);
+
+    const placeholder = (index: number) => `---IMAGE_BREAK_${index}---`;
+    const renderContainer = document.createElement('div');
+    renderContainer.innerHTML = html;
+    
+    renderContainer.querySelectorAll('img[data-image-index]').forEach(img => {
+        const indexStr = img.getAttribute('data-image-index');
+        if (indexStr) {
+            const index = parseInt(indexStr, 10);
+            const placeholderNode = document.createTextNode(placeholder(index));
+            img.parentNode?.replaceChild(placeholderNode, img);
+        }
+    });
+
+    const textWithPlaceholders = renderContainer.innerText;
+    const chunkRegex = /---IMAGE_BREAK_(\d+)---/;
+    const textAndImageParts = textWithPlaceholders.split(chunkRegex);
+
+    const originalName = docxFile.name.substring(0, docxFile.name.lastIndexOf('.')) || docxFile.name;
+
+    const base64ToFile = (base64: string, filename: string, mimeType: string): File => {
+        const byteCharacters = atob(base64);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) { byteNumbers[i] = byteCharacters.charCodeAt(i); }
+        const byteArray = new Uint8Array(byteNumbers);
+        const blob = new Blob([byteArray], { type: mimeType });
+        return new File([blob], filename, { type: mimeType });
+    }
+
+    let textChunkCount = 0;
+    for (let i = 0; i < textAndImageParts.length; i++) {
+        const part = textAndImageParts[i];
+        
+        if (i % 2 === 1) { // Image index part
+            const imageIndex = parseInt(part, 10);
+            const image = images[imageIndex];
+            if (image) {
+                const extension = image.contentType.split('/')[1] || 'png';
+                const imageFile = base64ToFile(image.data, `${originalName}-image${imageIndex + 1}.${extension}`, image.contentType);
+
+                newFilesToQueue.push({
+                    id: `${fileId}-image-${imageIndex}`,
+                    file: imageFile,
+                    type: 'image',
+                    status: ProcessingStatus.PENDING,
+                    originalFileSize: imageFile.size,
+                    imageAnalysisStatus: 'DONE',
+                    imageType: 'no-text',
+                });
+            }
+        } else { // Text part
+            const trimmedText = part.trim();
+            if (trimmedText) {
+                textChunkCount++;
+                const textFile = new File([trimmedText], `${originalName}-text${textChunkCount}.txt`, { type: 'text/plain' });
+                newFilesToQueue.push({
+                    id: `${fileId}-text-${textChunkCount}`,
+                    file: textFile,
+                    type: 'text',
+                    status: ProcessingStatus.PENDING,
+                    originalFileSize: textFile.size,
+                });
+            }
+        }
+    }
+    
+    addLog(`[${docxFile.name}] -> Deconstructed into ${newFilesToQueue.length} text and image chunk(s).`);
+    return newFilesToQueue;
+}
+
 
 const App: React.FC = () => {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
+  const [isRefining, setIsRefining] = useState(false);
   const [markdown, setMarkdown] = useState('');
+  const [lithicContent, setLithicContent] = useState('');
+  const [rawMarkdown, setRawMarkdown] = useState('');
+  const [refinementStreamContent, setRefinementStreamContent] = useState('');
   const [allAssets, setAllAssets] = useState<ImageAsset[]>([]);
-  const [finalFilename, setFinalFilename] = useState('logseq-export');
+  const [finalFilename, setFinalFilename] = useState('lithic-export');
   const [logs, setLogs] = useState<string[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [autoStartProcessing, setAutoStartProcessing] = useState(false);
   const [processingProgress, setProcessingProgress] = useState({ completed: 0, total: 0 });
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [croppingFile, setCroppingFile] = useState<UploadedFile | null>(null);
+  const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
 
-  const prevIsPreparingRef = useRef<boolean>(isPreparing);
+  const processingTriggerRef = useRef<(() => void) | null>(null);
   
   const MAX_SESSION_SIZE = 4 * 1024 * 1024 * 1024; // 4 GB
   const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
@@ -63,9 +171,10 @@ const App: React.FC = () => {
   }, []);
 
   const handleClear = () => {
-    setUploadedFiles([]); setIsProcessing(false); setMarkdown(''); setAllAssets([]);
-    setFinalFilename('logseq-export'); setLogs([]);
+    setUploadedFiles([]); setIsProcessing(false); setMarkdown(''); setLithicContent(''); setRawMarkdown(''); setAllAssets([]);
+    setFinalFilename('lithic-export'); setLogs([]);
     setUploadError(null); setAutoStartProcessing(false);
+    setSelectedIds(new Set());
   };
   
   const handleReprocess = () => {
@@ -83,6 +192,7 @@ const App: React.FC = () => {
         }))
     );
     setMarkdown('');
+    setRawMarkdown('');
     setAllAssets([]);
     setProcessingProgress({ completed: 0, total: 0 });
   };
@@ -95,8 +205,9 @@ const App: React.FC = () => {
     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
   };
 
-  const handleFilesSelected = async (fileList: FileList | null) => {
-    if (!fileList || fileList.length === 0) return;
+  const handleFilesSelected = useCallback(async (files: FileList | File[] | null) => {
+    if (!files || files.length === 0) return;
+    const fileArray = Array.from(files);
   
     setIsPreparing(true); setUploadError(null); setLogs(['Preparing uploaded files...']);
     const existingOriginalFilenames = new Set(uploadedFiles.map(f => f.originalFileName || f.file.name));
@@ -105,7 +216,7 @@ const App: React.FC = () => {
     const currentSize = calculateTotalSize(uploadedFiles);
     let sizeOfNewFiles = 0;
 
-    for (const file of Array.from(fileList)) {
+    for (const file of fileArray) {
         let newName = file.name;
         if (existingOriginalFilenames.has(newName)) {
             const namePart = newName.substring(0, newName.lastIndexOf('.'));
@@ -150,48 +261,102 @@ const App: React.FC = () => {
                 addLog(`[${uniqueFile.name}] Error: ${errorMessage}`);
                 setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
             }
-        } else if (uniqueFile.type.startsWith('video/')) {
-            try {
-                if (uniqueFile.size > MAX_FILE_SIZE) {
-                  setUploadError(`Error: "${uniqueFile.name}" (${formatSize(uniqueFile.size)}) exceeds the file limit of ${formatSize(MAX_FILE_SIZE)}.`);
-                  addLog(`[${uniqueFile.name}] Error: File size exceeds the 2 GB limit.`);
-                  continue;
-                }
-                const processedVideoFiles = await processVideoFile(uniqueFile, addLog);
-                newFilesToQueue.push(...processedVideoFiles);
-                sizeOfNewFiles += uniqueFile.size;
-            } catch (error) {
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                addLog(`[${uniqueFile.name}] Error processing video: ${errorMessage}`);
-                setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
-            }
         } else if (uniqueFile.type === 'application/pdf') {
             try {
-                const processedPdfFiles = await processPdfFile(uniqueFile, addLog);
-                newFilesToQueue.push(...processedPdfFiles);
-                sizeOfNewFiles += uniqueFile.size;
+                addLog(`[${uniqueFile.name}] Attempting PDF to DOCX conversion...`);
+                const docxFile = await convertPdfToDocx(uniqueFile);
+                
+                if (docxFile) {
+                    addLog(` -> Conversion successful. Processing as DOCX.`);
+                    const convertedDocxFileId = `${docxFile.name}-${Date.now()}`;
+                    const processedFiles = await processDocxFile(docxFile, convertedDocxFileId, addLog);
+                    
+                    const chunksWithOriginalRef = processedFiles.map(chunk => ({
+                        ...chunk,
+                        originalFileName: uniqueFile.name,
+                        originalFileSize: uniqueFile.size
+                    }));
+                    
+                    newFilesToQueue.push(...chunksWithOriginalRef);
+                    sizeOfNewFiles += uniqueFile.size;
+                } else {
+                    addLog(` -> Conversion failed. Falling back to standard PDF processing.`);
+                    const processedPdfFiles = await processPdfFile(uniqueFile, addLog);
+                    newFilesToQueue.push(...processedPdfFiles);
+                    sizeOfNewFiles += uniqueFile.size;
+                }
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 addLog(`[${uniqueFile.name}] Error processing PDF: ${errorMessage}`);
                 setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
             }
         } else if (uniqueFile.type.startsWith('image/')) {
-            const imageFile: UploadedFile = {
-                id: fileId, file: uniqueFile, type: 'image', status: ProcessingStatus.PENDING,
-                imageAnalysisStatus: 'PENDING', imageType: 'text',
-                originalFileSize: uniqueFile.size,
-            };
-            newFilesToQueue.push(imageFile);
-            sizeOfNewFiles += uniqueFile.size;
-            
-            classifyImageType(uniqueFile)
-              .then(imageType => {
-                setUploadedFiles(prev => prev.map(f => f.id === fileId ? { ...f, imageAnalysisStatus: 'DONE', imageType } : f));
-              })
-              .catch(err => {
-                console.error("Image analysis failed:", err);
-                setUploadedFiles(prev => prev.map(f => f.id === fileId ? { ...f, imageAnalysisStatus: 'ERROR', error: 'Failed to analyze image' } : f));
-              });
+            try {
+                addLog(`[${uniqueFile.name}] Slicing image into content blocks...`);
+                const slicedImageFiles = await sliceImageHorizontally(uniqueFile);
+                addLog(` -> Sliced into ${slicedImageFiles.length} chunk(s).`);
+                const isSliced = slicedImageFiles.length > 1;
+        
+                for (const slicedFile of slicedImageFiles) {
+                    const slicedFileId = `${slicedFile.name}-${Date.now()}`;
+                    const imageFile: UploadedFile = {
+                        id: slicedFileId, file: slicedFile, type: 'image', status: ProcessingStatus.PENDING,
+                        imageAnalysisStatus: 'DONE', imageType: 'text',
+                        originalFileSize: slicedFile.size,
+                        originalFileName: isSliced ? uniqueFile.name : undefined,
+                    };
+                    newFilesToQueue.push(imageFile);
+                }
+                sizeOfNewFiles += uniqueFile.size;
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                addLog(`[${uniqueFile.name}] Error slicing image: ${errorMessage}`);
+                setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
+            }
+        } else if (uniqueFile.type === 'text/html' || uniqueFile.name.endsWith('.html') || uniqueFile.name.endsWith('.htm')) {
+            try {
+                addLog(`[${uniqueFile.name}] Processing HTML file...`);
+                const htmlContent = await uniqueFile.text();
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(htmlContent, "text/html");
+                const extractedText = doc.body.innerText || doc.body.textContent || "";
+
+                if (extractedText.trim().length === 0) {
+                    addLog(`[${uniqueFile.name}] Skipped: No text content found in HTML body.`);
+                    continue;
+                }
+                const textFile = new File([extractedText], uniqueFile.name.replace(/\.(html?)$/i, '.txt'), { type: 'text/plain' });
+                const uploadedHtmlFile: UploadedFile = {
+                    id: fileId, file: textFile, type: 'text', status: ProcessingStatus.PENDING,
+                    originalFileSize: uniqueFile.size, originalFileName: uniqueFile.name,
+                };
+                newFilesToQueue.push(uploadedHtmlFile);
+                sizeOfNewFiles += uniqueFile.size;
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                addLog(`[${uniqueFile.name}] Error processing HTML: ${errorMessage}`);
+                setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
+            }
+        } else if (uniqueFile.name.endsWith('.docx')) {
+            try {
+                const processedFiles = await processDocxFile(uniqueFile, fileId, addLog);
+                newFilesToQueue.push(...processedFiles);
+                sizeOfNewFiles += uniqueFile.size;
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                addLog(`[${uniqueFile.name}] Error processing DOCX: ${errorMessage}`);
+                setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
+            }
+        } else if (uniqueFile.name.endsWith('.epub')) {
+            try {
+                const processedFiles = await processEpubFile(uniqueFile, fileId, addLog);
+                newFilesToQueue.push(...processedFiles);
+                sizeOfNewFiles += uniqueFile.size;
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                addLog(`[${uniqueFile.name}] Error processing EPUB: ${errorMessage}`);
+                setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
+            }
         } else {
             const isTextFile = uniqueFile.type.startsWith('text/') || uniqueFile.name.endsWith('.md') || uniqueFile.name.endsWith('.txt') || !uniqueFile.name.includes('.');
             if (isTextFile) {
@@ -212,33 +377,90 @@ const App: React.FC = () => {
   
     if (newFilesToQueue.length > 0) {
         setUploadedFiles(prev => [...prev, ...newFilesToQueue]);
+        setSelectedIds(prevSelectedIds => {
+            const newSelectedIds = new Set(prevSelectedIds);
+            newFilesToQueue.forEach(file => {
+                if (file.preselectedForDeletion) {
+                    newSelectedIds.add(file.id);
+                }
+            });
+            return newSelectedIds;
+        });
     }
     setLogs([]);
     setIsPreparing(false);
-  };
+  }, [addLog, uploadedFiles]);
   
-  const handleProcess = useCallback(async () => {
+  const isUploaderDisabled = isProcessing || isPreparing || isRefining || totalSize >= MAX_SESSION_SIZE;
+
+  useEffect(() => {
+    const handlePaste = async (event: ClipboardEvent) => {
+        if (isUploaderDisabled) return;
+
+        const items = event.clipboardData?.items;
+        if (!items) return;
+
+        const filePromises: Promise<File | null>[] = [];
+
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            if (item.type.startsWith('image/')) {
+                const blob = item.getAsFile();
+                if (blob) {
+                    const timestamp = new Date().getTime();
+                    const extension = blob.type.split('/')[1]?.split('+')[0] || 'png';
+                    const file = new File([blob], `pasted-image-${timestamp}.${extension}`, { type: blob.type });
+                    filePromises.push(Promise.resolve(file));
+                }
+            } else if (item.kind === 'string' && item.type.startsWith('text/plain')) {
+                filePromises.push(new Promise((resolve) => {
+                    item.getAsString((text) => {
+                        if (text && text.trim()) {
+                            const timestamp = new Date().getTime();
+                            const file = new File([text], `pasted-text-${timestamp}.txt`, { type: 'text/plain' });
+                            resolve(file);
+                        } else {
+                            resolve(null);
+                        }
+                    });
+                }));
+            }
+        }
+
+        if (filePromises.length === 0) return;
+
+        const pastedFiles = (await Promise.all(filePromises)).filter((f): f is File => f !== null);
+
+        if (pastedFiles.length > 0) {
+            handleFilesSelected(pastedFiles);
+        }
+    };
+
+    window.addEventListener('paste', handlePaste);
+
+    return () => {
+        window.removeEventListener('paste', handlePaste);
+    };
+  }, [isUploaderDisabled, handleFilesSelected]);
+
+  const startProcessingLogic = useCallback(async (allFilesForProcessing: UploadedFile[]) => {
     setIsProcessing(true);
+    setSelectedIds(new Set());
     let tempMarkdown = '';
     const tempAssets: ImageAsset[] = [];
 
-    const filesToProcess = uploadedFiles.filter(f => f.status === ProcessingStatus.PENDING || f.status === ProcessingStatus.ERROR);
+    const filesToProcess = allFilesForProcessing.filter(f => f.status === ProcessingStatus.PENDING || f.status === ProcessingStatus.ERROR);
     setProcessingProgress({ completed: 0, total: filesToProcess.length });
 
-    for (const uploadedFile of uploadedFiles) {
+    for (const uploadedFile of allFilesForProcessing) {
         if (uploadedFile.status !== ProcessingStatus.PENDING && uploadedFile.status !== ProcessingStatus.ERROR) {
-            // This file is already processed, reconstruct its part of the markdown/assets
             if (uploadedFile.transcription) {
-                if (uploadedFile.type === 'text') {
-                    tempMarkdown += (tempMarkdown ? '\n\n' : '') + uploadedFile.transcription;
-                } else {
-                    tempMarkdown += (tempMarkdown ? '\n\n- ' : '- ') + uploadedFile.transcription;
-                }
+                tempMarkdown += (tempMarkdown ? '\n\n' : '') + uploadedFile.transcription;
             }
             if (uploadedFile.assets) {
               tempAssets.push(...uploadedFile.assets);
               uploadedFile.assets.forEach(asset => {
-                  tempMarkdown += `\n\n- ![[assets/${asset.fileName}]]\n  - ${asset.description}`;
+                  tempMarkdown += `\n\n![${asset.description}](assets/${asset.fileName})`;
               });
             }
             continue;
@@ -255,17 +477,17 @@ const App: React.FC = () => {
                     (attempt) => setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, retryingMessage: `Transcription failed (Attempt ${attempt}). Retrying...` } : f))
                 );
                 setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, status: ProcessingStatus.DONE, transcription: fullTranscription, partialTranscription: '', processingEndTime: Date.now() } : f));
-                if (fullTranscription) tempMarkdown += (tempMarkdown ? '\n\n- ' : '- ') + fullTranscription;
+                if (fullTranscription) tempMarkdown += (tempMarkdown ? '\n\n' : '') + fullTranscription;
             } else if (uploadedFile.type === 'image') {
                 const { transcription, assets } = await processImage(uploadedFile.file, uploadedFile.imageType || 'text',
                     (chunk) => setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, partialTranscription: (f.partialTranscription || '') + chunk } : f))
                 );
                 setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, status: ProcessingStatus.DONE, transcription, assets, partialTranscription: '', processingEndTime: Date.now() } : f));
-                if (transcription) tempMarkdown += (tempMarkdown ? '\n\n- ' : '- ') + transcription;
+                if (transcription) tempMarkdown += (tempMarkdown ? '\n\n' : '') + transcription;
                 if (assets) {
                   tempAssets.push(...assets);
                   assets.forEach(asset => {
-                      tempMarkdown += `\n\n- ![[assets/${asset.fileName}]]\n  - ${asset.description}`;
+                    tempMarkdown += `\n\n![${asset.description}](assets/${asset.fileName})`;
                   });
                 }
             } else if (uploadedFile.type === 'text') {
@@ -312,28 +534,97 @@ const App: React.FC = () => {
         }
     }
     
-    setMarkdown(tempMarkdown);
-    setAllAssets(tempAssets);
     setIsProcessing(false);
-  }, [uploadedFiles]);
+
+    if (tempMarkdown.trim().length > 0) {
+        setRawMarkdown(tempMarkdown);
+        setIsRefining(true);
+        setRefinementStreamContent('');
+        try {
+            const refinedMarkdown = await refineMarkdownStream(
+              tempMarkdown,
+              (chunk) => setRefinementStreamContent(prev => prev + chunk)
+            );
+            
+            if (refinedMarkdown) {
+                const firstLine = refinedMarkdown.split('\n')[0] || 'lithic-export';
+                const sanitizedFilename = firstLine
+                    .replace(/^-?\s*#+\s*/, '')
+                    .trim()
+                    .replace(/[\\/:*?"<>|]/g, '')
+                    .replace(/\s+/g, '-')
+                    .replace(/-+/g, '-')
+                    .substring(0, 100);
+                
+                setFinalFilename(sanitizedFilename || 'lithic-export');
+                setLithicContent(parseMarkdownToLithic(refinedMarkdown, sanitizedFilename));
+            }
+
+            setMarkdown(refinedMarkdown);
+        } catch (error) {
+            console.error("Refining failed:", error);
+            setMarkdown(tempMarkdown);
+        } finally {
+            setIsRefining(false);
+        }
+    } else {
+        setRawMarkdown(tempMarkdown);
+        setMarkdown(tempMarkdown);
+    }
+    
+    setAllAssets(tempAssets);
+  }, []);
 
   useEffect(() => {
-    if (prevIsPreparingRef.current && !isPreparing && autoStartProcessing) {
-      if (uploadedFiles.some(f => f.status === ProcessingStatus.PENDING || f.status === ProcessingStatus.ERROR)) {
-        handleProcess();
-        setAutoStartProcessing(false);
-      }
+    if (processingTriggerRef.current) {
+        processingTriggerRef.current();
+        processingTriggerRef.current = null;
     }
-    prevIsPreparingRef.current = isPreparing;
-  }, [isPreparing, autoStartProcessing, uploadedFiles, handleProcess]);
+  }, [uploadedFiles]);
+
+  const handleProcessClick = () => {
+    const filesMarkedForDeletion = uploadedFiles.filter(f => selectedIds.has(f.id));
+    if (filesMarkedForDeletion.length > 0 && pendingFilesCount > 0) {
+        setShowDeleteConfirmation(true);
+    } else if (pendingFilesCount > 0) {
+        startProcessingLogic(uploadedFiles);
+    }
+  };
+
+  const handleProcessWithDeletions = () => {
+      setShowDeleteConfirmation(false);
+      startProcessingLogic(uploadedFiles);
+  };
+
+  const handleProcessAfterDeletion = () => {
+      setShowDeleteConfirmation(false);
+      const filesToKeep = uploadedFiles.filter(f => !selectedIds.has(f.id));
+      setUploadedFiles(filesToKeep);
+      // Processing will be triggered by the useEffect that watches uploadedFiles
+      processingTriggerRef.current = () => startProcessingLogic(filesToKeep);
+  };
 
   const handleDownload = () => {
-    const blob = new Blob([markdown], { type: 'text/markdown' });
+    const content = lithicContent || markdown;
+    const blob = new Blob([content], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${finalFilename}.md`;
+    a.download = `${finalFilename}.lith`;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+  
+  const handleDownloadRawMarkdown = () => {
+    if (!rawMarkdown) return;
+    const blob = new Blob([rawMarkdown], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${finalFilename}-debug.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
@@ -344,14 +635,75 @@ const App: React.FC = () => {
     const idsToRemove = new Set(ids);
     setUploadedFiles(prev => prev.filter(file => !idsToRemove.has(file.id)));
   };
+
+  const handleOpenCropModal = (fileId: string) => {
+    const fileToCrop = uploadedFiles.find(f => f.id === fileId);
+    if (fileToCrop) {
+      setCroppingFile(fileToCrop);
+    }
+  };
+
+  const handleCloseCropModal = () => {
+    setCroppingFile(null);
+  };
+
+  const handleCropConfirm = async (originalFileId: string, cropBox: { x: number; y: number; width: number; height: number }) => {
+    const originalFileIndex = uploadedFiles.findIndex(f => f.id === originalFileId);
+    if (originalFileIndex === -1) return;
+
+    const originalUploadedFile = uploadedFiles[originalFileIndex];
+
+    try {
+        const croppedFileWithOldName = await cropImageFile(originalUploadedFile.file, cropBox);
+
+        const originalName = originalUploadedFile.file.name.substring(0, originalUploadedFile.file.name.lastIndexOf('.')) || originalUploadedFile.file.name;
+        const fileExt = originalUploadedFile.file.name.split('.').pop() || 'png';
+        
+        const cropCount = uploadedFiles.filter(f => f.originalFileName === originalUploadedFile.file.name).length;
+        const newFileName = `${originalName}-crop${cropCount + 1}.${fileExt}`;
+
+        const newFile = new File([croppedFileWithOldName], newFileName, { type: croppedFileWithOldName.type, lastModified: Date.now() });
+
+        const newUploadedFile: UploadedFile = {
+            id: `${originalUploadedFile.id}-crop-${Date.now()}`,
+            file: newFile,
+            type: 'image',
+            status: ProcessingStatus.PENDING,
+            originalFileSize: newFile.size,
+            imageAnalysisStatus: 'DONE',
+            imageType: 'no-text',
+            originalFileName: originalUploadedFile.file.name,
+        };
+
+        setUploadedFiles(prevFiles => {
+            const newFiles = [...prevFiles];
+            const updatedOriginal = { ...newFiles[originalFileIndex], preselectedForDeletion: true };
+            newFiles[originalFileIndex] = updatedOriginal;
+            
+            newFiles.splice(originalFileIndex + 1, 0, newUploadedFile);
+            return newFiles;
+        });
+
+        setSelectedIds(prevSelectedIds => {
+            const newSelectedIds = new Set(prevSelectedIds);
+            newSelectedIds.add(originalFileId);
+            return newSelectedIds;
+        });
+
+    } catch (error) {
+        console.error("Failed to crop image:", error);
+    } finally {
+        handleCloseCropModal();
+    }
+  };
+
   const pendingFilesCount = uploadedFiles.filter(f => f.status === ProcessingStatus.PENDING || f.status === ProcessingStatus.ERROR).length;
-  const isUploaderDisabled = isProcessing || isPreparing || totalSize >= MAX_SESSION_SIZE;
 
   return (
     <div className="min-h-screen flex flex-col items-center p-4 sm:p-8">
       <header className="w-full max-w-2xl mx-auto text-center mb-8">
-        <h1 className="text-3xl font-bold text-slate-100 mb-2">Multimedia to Logseq Processor</h1>
-        <p className="text-slate-400">Upload audio, video, or image files to collate into a Logseq-friendly markdown page.</p>
+        <h1 className="text-3xl font-bold text-slate-100 mb-2">_to-lithic: Multimedia Processor</h1>
+        <p className="text-slate-400">Upload document, image, or audio files to collate into a Monolith-friendly Streams-node layout.</p>
       </header>
 
       <main className="w-full flex-1">
@@ -384,7 +736,7 @@ const App: React.FC = () => {
 
               {uploadedFiles.length > 0 && (
                 <div className="w-full max-w-2xl mx-auto mt-8 mb-6 text-center">
-                  <button onClick={handleProcess} disabled={pendingFilesCount === 0 || isProcessing || isPreparing}
+                  <button onClick={handleProcessClick} disabled={pendingFilesCount === 0 || isProcessing || isPreparing || isRefining}
                     className="inline-flex items-center justify-center px-8 py-3 text-base font-medium text-white bg-indigo-600 border border-transparent rounded-md shadow-sm hover:bg-indigo-700 disabled:bg-slate-600 disabled:cursor-not-allowed transition-colors">
                     {isProcessing ? (
                       <>
@@ -392,21 +744,49 @@ const App: React.FC = () => {
                         Processing...
                         {processingProgress.total > 0 && <span className="ml-2">({processingProgress.completed}/{processingProgress.total})</span>}
                       </>
+                    ) : isRefining ? (
+                      <>
+                        <SpinnerIcon className="w-5 h-5 mr-3" />
+                        Refining Document...
+                      </>
                     ) : `Process ${pendingFilesCount} File${pendingFilesCount !== 1 ? 's' : ''}`}
                   </button>
                 </div>
               )}
 
-              <FileList files={uploadedFiles} onReorder={setUploadedFiles} isProcessing={isProcessing}
-                onRemoveMultiple={handleRemoveMultipleFiles} onUpdateFile={handleUpdateFile} />
+              {isRefining ? (
+                <RefinementPreview content={refinementStreamContent} />
+              ) : (
+                <FileList files={uploadedFiles} onReorder={setUploadedFiles} isProcessing={isProcessing || isRefining}
+                  onRemoveMultiple={handleRemoveMultipleFiles} onUpdateFile={handleUpdateFile}
+                  selectedIds={selectedIds} onSelectionChange={setSelectedIds} onOpenCropModal={handleOpenCropModal} />
+              )}
             </>
           )}
 
-        {markdown && (
-          <ResultPreview markdown={markdown} assets={allAssets} onDownload={handleDownload} onClear={handleClear} onReprocess={handleReprocess}
-            filename={finalFilename} onFilenameChange={setFinalFilename} />
+        {markdown && !isRefining && (
+          <ResultPreview markdown={markdown} lithicContent={lithicContent} assets={allAssets} onDownload={handleDownload} onClear={handleClear} onReprocess={handleReprocess}
+            filename={finalFilename} onFilenameChange={setFinalFilename} rawMarkdown={rawMarkdown} onDownloadRaw={handleDownloadRawMarkdown} />
         )}
       </main>
+
+      {croppingFile && (
+          <ManualCropModal
+            fileToCrop={croppingFile}
+            onClose={handleCloseCropModal}
+            onConfirm={handleCropConfirm}
+          />
+        )}
+      
+      {showDeleteConfirmation && (
+          <ConfirmationModal
+            count={selectedIds.size}
+            onClose={() => setShowDeleteConfirmation(false)}
+            onIgnore={handleProcessWithDeletions}
+            onConfirm={handleProcessAfterDeletion}
+          />
+      )}
+
       <footer className="w-full max-w-2xl mx-auto text-center mt-8">
         <p className="text-xs text-slate-500">
             Note: Files are processed in-browser and streamed directly to the API. Your files are not stored on any server.
