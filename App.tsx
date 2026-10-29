@@ -1,22 +1,21 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { UploadedFile, ProcessingStatus, ImageAsset } from './types';
-import { transcribeAudioStream, processImage, sliceImageHorizontally, refineMarkdownStream, cropImageFile } from './services/geminiService';
+import { transcribeAudioStream, processImage, sliceImageHorizontally, refineMarkdownStream, cropImageFile, generateBookPrefix } from './services/geminiService';
 import { parseMarkdownToLithic } from './services/lithicService';
 import { processPdfFile } from './services/pdfService';
-import { convertPdfToDocx } from './services/pdfConverterService';
 import { processEpubFile } from './services/epubService';
+import { processDocxFile } from './services/docxService';
+import { processPptxFile } from './services/pptxService';
 import { chunkAudioFile } from './services/audioService';
+import { processJsonFile } from './services/jsonService';
 import FileUpload from './components/FileUpload';
 import FileList from './components/FileList';
 import ResultPreview from './components/TranscriptionPreview';
 import ProcessingLog from './components/ProcessingLog';
-import ApiUsageCounter from './components/ApiUsageCounter';
-import RefinementPreview from './components/RefinementPreview';
 import ManualCropModal from './components/ManualCropModal';
 import ConfirmationModal from './components/ConfirmationModal';
+import PrefixPromptModal from './components/PrefixPromptModal';
 import { SpinnerIcon } from './components/icons';
-import JSZip from 'jszip';
-import mammoth from 'mammoth';
 
 
 // --- React Component ---
@@ -26,122 +25,24 @@ const calculateTotalSize = (files: UploadedFile[]): number => {
     let total = 0;
 
     files.forEach(file => {
-        // If it's a chunk of a larger file, only count the original's size once
         if (file.originalFileName) {
             if (!processedOriginals.has(file.originalFileName)) {
                 total += file.originalFileSize || 0;
                 processedOriginals.add(file.originalFileName);
             }
-        } 
-        // If it's a standalone file
-        else {
+        } else {
             total += file.originalFileSize || file.file.size;
         }
     });
     return total;
 };
 
-const processDocxFile = async (
-    docxFile: File,
-    fileId: string,
-    addLog: (message: string, replaceLast?: boolean) => void
-): Promise<UploadedFile[]> => {
-    const newFilesToQueue: UploadedFile[] = [];
-    addLog(`[${docxFile.name}] Deconstructing DOCX file...`);
-    
-    const arrayBuffer = await docxFile.arrayBuffer();
-    
-    const images: { data: string, contentType: string }[] = [];
-    const imageConverterOptions = {
-        convertImage: mammoth.images.inline((element: any) => {
-            const index = images.length;
-            return element.read("base64").then((imageBuffer: string) => {
-                images.push({ data: imageBuffer, contentType: element.contentType });
-                return {
-                    src: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
-                    'data-image-index': index.toString()
-                };
-            });
-        })
-    };
-    
-    const { value: html } = await mammoth.convertToHtml({ arrayBuffer }, imageConverterOptions);
-
-    const placeholder = (index: number) => `---IMAGE_BREAK_${index}---`;
-    const renderContainer = document.createElement('div');
-    renderContainer.innerHTML = html;
-    
-    renderContainer.querySelectorAll('img[data-image-index]').forEach(img => {
-        const indexStr = img.getAttribute('data-image-index');
-        if (indexStr) {
-            const index = parseInt(indexStr, 10);
-            const placeholderNode = document.createTextNode(placeholder(index));
-            img.parentNode?.replaceChild(placeholderNode, img);
-        }
-    });
-
-    const textWithPlaceholders = renderContainer.innerText;
-    const chunkRegex = /---IMAGE_BREAK_(\d+)---/;
-    const textAndImageParts = textWithPlaceholders.split(chunkRegex);
-
-    const originalName = docxFile.name.substring(0, docxFile.name.lastIndexOf('.')) || docxFile.name;
-
-    const base64ToFile = (base64: string, filename: string, mimeType: string): File => {
-        const byteCharacters = atob(base64);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let i = 0; i < byteCharacters.length; i++) { byteNumbers[i] = byteCharacters.charCodeAt(i); }
-        const byteArray = new Uint8Array(byteNumbers);
-        const blob = new Blob([byteArray], { type: mimeType });
-        return new File([blob], filename, { type: mimeType });
-    }
-
-    let textChunkCount = 0;
-    for (let i = 0; i < textAndImageParts.length; i++) {
-        const part = textAndImageParts[i];
-        
-        if (i % 2 === 1) { // Image index part
-            const imageIndex = parseInt(part, 10);
-            const image = images[imageIndex];
-            if (image) {
-                const extension = image.contentType.split('/')[1] || 'png';
-                const imageFile = base64ToFile(image.data, `${originalName}-image${imageIndex + 1}.${extension}`, image.contentType);
-
-                newFilesToQueue.push({
-                    id: `${fileId}-image-${imageIndex}`,
-                    file: imageFile,
-                    type: 'image',
-                    status: ProcessingStatus.PENDING,
-                    originalFileSize: imageFile.size,
-                    imageAnalysisStatus: 'DONE',
-                    imageType: 'no-text',
-                });
-            }
-        } else { // Text part
-            const trimmedText = part.trim();
-            if (trimmedText) {
-                textChunkCount++;
-                const textFile = new File([trimmedText], `${originalName}-text${textChunkCount}.txt`, { type: 'text/plain' });
-                newFilesToQueue.push({
-                    id: `${fileId}-text-${textChunkCount}`,
-                    file: textFile,
-                    type: 'text',
-                    status: ProcessingStatus.PENDING,
-                    originalFileSize: textFile.size,
-                });
-            }
-        }
-    }
-    
-    addLog(`[${docxFile.name}] -> Deconstructed into ${newFilesToQueue.length} text and image chunk(s).`);
-    return newFilesToQueue;
-}
-
-
 const App: React.FC = () => {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isPreparing, setIsPreparing] = useState(false);
   const [isRefining, setIsRefining] = useState(false);
+  const [isGeneratingPrefix, setIsGeneratingPrefix] = useState(false);
   const [markdown, setMarkdown] = useState('');
   const [lithicContent, setLithicContent] = useState('');
   const [rawMarkdown, setRawMarkdown] = useState('');
@@ -150,13 +51,21 @@ const App: React.FC = () => {
   const [finalFilename, setFinalFilename] = useState('lithic-export');
   const [logs, setLogs] = useState<string[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
-  const [autoStartProcessing, setAutoStartProcessing] = useState(false);
+  const [autoStartProcessing, setAutoStartProcessing] = useState(true);
   const [processingProgress, setProcessingProgress] = useState({ completed: 0, total: 0 });
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [croppingFile, setCroppingFile] = useState<UploadedFile | null>(null);
   const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
+  const [skipRefinement, setSkipRefinement] = useState(false);
+  const [prefixPromptResolve, setPrefixPromptResolve] = useState<((prefix: string) => void) | null>(null);
 
-  const processingTriggerRef = useRef<(() => void) | null>(null);
+  const requestPrefixFromUser = (): Promise<string> => {
+    return new Promise((resolve) => {
+      setPrefixPromptResolve(() => resolve);
+    });
+  };
+
+  const processingTriggerRef = useRef<boolean>(false);
   
   const MAX_SESSION_SIZE = 4 * 1024 * 1024 * 1024; // 4 GB
   const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
@@ -173,7 +82,7 @@ const App: React.FC = () => {
   const handleClear = () => {
     setUploadedFiles([]); setIsProcessing(false); setMarkdown(''); setLithicContent(''); setRawMarkdown(''); setAllAssets([]);
     setFinalFilename('lithic-export'); setLogs([]);
-    setUploadError(null); setAutoStartProcessing(false);
+    setUploadError(null);
     setSelectedIds(new Set());
   };
   
@@ -234,14 +143,25 @@ const App: React.FC = () => {
             break;
         }
 
-        if (uniqueFile.type.startsWith('audio/')) {
+        const isAudioFile = uniqueFile.type.startsWith('audio/') || 
+                            (uniqueFile.type === 'video/webm' && uniqueFile.name.toLowerCase().endsWith('.webm')) || 
+                            (uniqueFile.type === '' && uniqueFile.name.toLowerCase().endsWith('.webm'));
+
+        if (isAudioFile) {
             try {
                 if (uniqueFile.size > MAX_FILE_SIZE) {
                   setUploadError(`Error: "${uniqueFile.name}" (${formatSize(uniqueFile.size)}) exceeds the file limit of ${formatSize(MAX_FILE_SIZE)}.`);
                   addLog(`[${uniqueFile.name}] Error: File size exceeds the 2 GB limit.`);
                   continue;
                 }
-                const { chunkData } = await chunkAudioFile(uniqueFile, addLog);
+                
+                // Ensure the file has a valid MIME type for Gemini API
+                let fileToProcess = uniqueFile;
+                if ((uniqueFile.type === '' || uniqueFile.type === 'video/webm') && uniqueFile.name.toLowerCase().endsWith('.webm')) {
+                    fileToProcess = new File([uniqueFile], uniqueFile.name, { type: 'audio/webm' });
+                }
+
+                const { chunkData } = await chunkAudioFile(fileToProcess, addLog);
                 const isChunked = chunkData.length > 1;
                 newFilesToQueue.push(...chunkData.map((chunk, index): UploadedFile => ({
                     id: `${fileId}-${index}`,
@@ -263,28 +183,9 @@ const App: React.FC = () => {
             }
         } else if (uniqueFile.type === 'application/pdf') {
             try {
-                addLog(`[${uniqueFile.name}] Attempting PDF to DOCX conversion...`);
-                const docxFile = await convertPdfToDocx(uniqueFile);
-                
-                if (docxFile) {
-                    addLog(` -> Conversion successful. Processing as DOCX.`);
-                    const convertedDocxFileId = `${docxFile.name}-${Date.now()}`;
-                    const processedFiles = await processDocxFile(docxFile, convertedDocxFileId, addLog);
-                    
-                    const chunksWithOriginalRef = processedFiles.map(chunk => ({
-                        ...chunk,
-                        originalFileName: uniqueFile.name,
-                        originalFileSize: uniqueFile.size
-                    }));
-                    
-                    newFilesToQueue.push(...chunksWithOriginalRef);
-                    sizeOfNewFiles += uniqueFile.size;
-                } else {
-                    addLog(` -> Conversion failed. Falling back to standard PDF processing.`);
-                    const processedPdfFiles = await processPdfFile(uniqueFile, addLog);
-                    newFilesToQueue.push(...processedPdfFiles);
-                    sizeOfNewFiles += uniqueFile.size;
-                }
+                const processedPdfFiles = await processPdfFile(uniqueFile, addLog);
+                newFilesToQueue.push(...processedPdfFiles);
+                sizeOfNewFiles += uniqueFile.size;
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 addLog(`[${uniqueFile.name}] Error processing PDF: ${errorMessage}`);
@@ -342,9 +243,20 @@ const App: React.FC = () => {
                 const processedFiles = await processDocxFile(uniqueFile, fileId, addLog);
                 newFilesToQueue.push(...processedFiles);
                 sizeOfNewFiles += uniqueFile.size;
+                setSkipRefinement(true);
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 addLog(`[${uniqueFile.name}] Error processing DOCX: ${errorMessage}`);
+                setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
+            }
+        } else if (uniqueFile.name.endsWith('.pptx')) {
+            try {
+                const processedFiles = await processPptxFile(uniqueFile, fileId, addLog);
+                newFilesToQueue.push(...processedFiles);
+                sizeOfNewFiles += uniqueFile.size;
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                addLog(`[${uniqueFile.name}] Error processing PPTX: ${errorMessage}`);
                 setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
             }
         } else if (uniqueFile.name.endsWith('.epub')) {
@@ -352,9 +264,27 @@ const App: React.FC = () => {
                 const processedFiles = await processEpubFile(uniqueFile, fileId, addLog);
                 newFilesToQueue.push(...processedFiles);
                 sizeOfNewFiles += uniqueFile.size;
+                setSkipRefinement(true);
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 addLog(`[${uniqueFile.name}] Error processing EPUB: ${errorMessage}`);
+                setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
+            }
+        } else if (uniqueFile.name.endsWith('.json') || uniqueFile.type === 'application/json') {
+            try {
+                const jsonMarkdown = await processJsonFile(uniqueFile);
+                newFilesToQueue.push({
+                    id: fileId,
+                    file: uniqueFile,
+                    originalFileName: uniqueFile.name,
+                    status: ProcessingStatus.DONE,
+                    transcription: jsonMarkdown,
+                    size: uniqueFile.size
+                });
+                sizeOfNewFiles += uniqueFile.size;
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                addLog(`[${uniqueFile.name}] Error processing JSON: ${errorMessage}`);
                 setUploadError(`Error with "${uniqueFile.name}": ${errorMessage}`);
             }
         } else {
@@ -376,7 +306,13 @@ const App: React.FC = () => {
     }
   
     if (newFilesToQueue.length > 0) {
-        setUploadedFiles(prev => [...prev, ...newFilesToQueue]);
+        setUploadedFiles(prev => {
+            const nextFiles = [...prev, ...newFilesToQueue];
+            if (autoStartProcessing) {
+                processingTriggerRef.current = true;
+            }
+            return nextFiles;
+        });
         setSelectedIds(prevSelectedIds => {
             const newSelectedIds = new Set(prevSelectedIds);
             newFilesToQueue.forEach(file => {
@@ -389,7 +325,8 @@ const App: React.FC = () => {
     }
     setLogs([]);
     setIsPreparing(false);
-  }, [addLog, uploadedFiles]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addLog, uploadedFiles, autoStartProcessing]);
   
   const isUploaderDisabled = isProcessing || isPreparing || isRefining || totalSize >= MAX_SESSION_SIZE;
 
@@ -474,7 +411,8 @@ const App: React.FC = () => {
             if (uploadedFile.type === 'audio') {
                 const fullTranscription = await transcribeAudioStream(uploadedFile.file,
                     (chunk) => setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, partialTranscription: (f.partialTranscription || '') + chunk } : f)),
-                    (attempt) => setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, retryingMessage: `Transcription failed (Attempt ${attempt}). Retrying...` } : f))
+                    (attempt) => setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, retryingMessage: `Transcription failed (Attempt ${attempt}). Retrying...` } : f)),
+                    (msg) => setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, currentLogMessage: msg } : f))
                 );
                 setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, status: ProcessingStatus.DONE, transcription: fullTranscription, partialTranscription: '', processingEndTime: Date.now() } : f));
                 if (fullTranscription) tempMarkdown += (tempMarkdown ? '\n\n' : '') + fullTranscription;
@@ -497,8 +435,11 @@ const App: React.FC = () => {
 
                 const processedContent = blocks.map(block => {
                     const isPreformatted = /^\s/.test(block);
+                    const isHeader = /^#{1,6}\s/.test(block.trim());
 
-                    if (isPreformatted) {
+                    if (isHeader) {
+                        return block.trim();
+                    } else if (isPreformatted) {
                         const lines = block.split('\n');
                         const firstLine = lines[0];
                         const restOfLines = lines.slice(1);
@@ -531,6 +472,8 @@ const App: React.FC = () => {
             setUploadedFiles(prev => prev.map(f => f.id === uploadedFile.id ? { ...f, status: ProcessingStatus.ERROR, error: errorMessage, processingEndTime: Date.now() } : f));
         } finally {
             setProcessingProgress(prev => ({ ...prev, completed: prev.completed + 1 }));
+            // Add a slight delay to respect rate limits
+            await new Promise(resolve => setTimeout(resolve, 2000));
         }
     }
     
@@ -538,34 +481,91 @@ const App: React.FC = () => {
 
     if (tempMarkdown.trim().length > 0) {
         setRawMarkdown(tempMarkdown);
-        setIsRefining(true);
-        setRefinementStreamContent('');
-        try {
-            const refinedMarkdown = await refineMarkdownStream(
-              tempMarkdown,
-              (chunk) => setRefinementStreamContent(prev => prev + chunk)
-            );
-            
-            if (refinedMarkdown) {
-                const firstLine = refinedMarkdown.split('\n')[0] || 'lithic-export';
-                const sanitizedFilename = firstLine
-                    .replace(/^-?\s*#+\s*/, '')
-                    .trim()
+        let prefix = 'DOC';
+        
+        const uniqueOriginalFiles = Array.from(new Set(allFilesForProcessing.map(f => f.originalFileName || f.file.name)));
+        let useOriginalFilename = false;
+        let originalBaseName = '';
+        
+        if (uniqueOriginalFiles.length === 1) {
+            const baseName = uniqueOriginalFiles[0].replace(/\.[^/.]+$/, "");
+            if (baseName.length <= 30) {
+                useOriginalFilename = true;
+                originalBaseName = baseName
                     .replace(/[\\/:*?"<>|]/g, '')
                     .replace(/\s+/g, '-')
                     .replace(/-+/g, '-')
-                    .substring(0, 100);
-                
-                setFinalFilename(sanitizedFilename || 'lithic-export');
-                setLithicContent(parseMarkdownToLithic(refinedMarkdown, sanitizedFilename));
+                    .trim();
             }
+        }
 
-            setMarkdown(refinedMarkdown);
-        } catch (error) {
-            console.error("Refining failed:", error);
-            setMarkdown(tempMarkdown);
+        try {
+            setIsGeneratingPrefix(true);
+            setLogs(['Starting shortcode generation...']);
+            let fileNamesStr = uniqueOriginalFiles.slice(0, 10).join(', ');
+            if (uniqueOriginalFiles.length > 10) fileNamesStr += '...';
+            prefix = await generateBookPrefix(tempMarkdown, fileNamesStr, (msg) => setLogs(prev => [...prev, msg]));
+            if (!prefix || prefix === 'DOC') {
+                setIsGeneratingPrefix(false);
+                prefix = await requestPrefixFromUser();
+            }
+        } catch (err) {
+            console.error("Could not generate prefix", err);
+            setIsGeneratingPrefix(false);
+            prefix = await requestPrefixFromUser();
         } finally {
-            setIsRefining(false);
+            setIsGeneratingPrefix(false);
+        }
+
+        const finalBaseName = (useOriginalFilename && originalBaseName) 
+            ? originalBaseName 
+            : (prefix !== 'DOC' && prefix ? prefix : '');
+
+        if (skipRefinement) {
+            const firstLine = tempMarkdown.split('\n')[0] || 'lithic-export';
+            const sanitizedFilename = firstLine
+                .replace(/^-?\s*#+\s*/, '')
+                .trim()
+                .replace(/[\\/:*?"<>|]/g, '')
+                .replace(/\s+/g, '-')
+                .replace(/-+/g, '-')
+                .substring(0, 100);
+            
+            setFinalFilename(finalBaseName || sanitizedFilename || 'lithic-export');
+            setLithicContent(parseMarkdownToLithic(tempMarkdown, sanitizedFilename || 'Imported Content', tempAssets, prefix));
+            setMarkdown(tempMarkdown);
+        } else {
+            setIsRefining(true);
+            setLogs(['Starting document refinement...']);
+            setRefinementStreamContent('');
+            try {
+                const refinedMarkdown = await refineMarkdownStream(
+                  tempMarkdown,
+                  (chunk) => setRefinementStreamContent(prev => prev + chunk),
+                  (msg) => setLogs(prev => [...prev, msg])
+                );
+                
+                if (refinedMarkdown) {
+                    const firstLine = refinedMarkdown.split('\n')[0] || 'lithic-export';
+                    const sanitizedFilename = firstLine
+                        .replace(/^-?\s*#+\s*/, '')
+                        .trim()
+                        .replace(/[\\/:*?"<>|]/g, '')
+                        .replace(/\s+/g, '-')
+                        .replace(/-+/g, '-')
+                        .substring(0, 100);
+                    
+                    setFinalFilename(finalBaseName || sanitizedFilename || 'lithic-export');
+                    setLithicContent(parseMarkdownToLithic(refinedMarkdown, sanitizedFilename || 'Imported Content', tempAssets, prefix));
+                }
+
+                setMarkdown(refinedMarkdown);
+            } catch (error) {
+                console.error("Refining failed:", error);
+                setMarkdown(tempMarkdown);
+            } finally {
+                setIsRefining(false);
+            }
         }
     } else {
         setRawMarkdown(tempMarkdown);
@@ -573,14 +573,14 @@ const App: React.FC = () => {
     }
     
     setAllAssets(tempAssets);
-  }, []);
+  }, [skipRefinement]);
 
   useEffect(() => {
     if (processingTriggerRef.current) {
-        processingTriggerRef.current();
-        processingTriggerRef.current = null;
+        processingTriggerRef.current = false;
+        startProcessingLogic(uploadedFiles);
     }
-  }, [uploadedFiles]);
+  }, [uploadedFiles, startProcessingLogic]);
 
   const handleProcessClick = () => {
     const filesMarkedForDeletion = uploadedFiles.filter(f => selectedIds.has(f.id));
@@ -601,7 +601,7 @@ const App: React.FC = () => {
       const filesToKeep = uploadedFiles.filter(f => !selectedIds.has(f.id));
       setUploadedFiles(filesToKeep);
       // Processing will be triggered by the useEffect that watches uploadedFiles
-      processingTriggerRef.current = () => startProcessingLogic(filesToKeep);
+      processingTriggerRef.current = true;
   };
 
   const handleDownload = () => {
@@ -615,13 +615,26 @@ const App: React.FC = () => {
     URL.revokeObjectURL(url);
   };
   
-  const handleDownloadRawMarkdown = () => {
-    if (!rawMarkdown) return;
-    const blob = new Blob([rawMarkdown], { type: 'text/markdown' });
+  const handleDownloadMarkdown = () => {
+    if (!markdown) return;
+    const blob = new Blob([markdown], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${finalFilename}-debug.md`;
+    a.download = `${finalFilename}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadDebugPlaintext = () => {
+    if (!rawMarkdown) return;
+    const blob = new Blob([rawMarkdown], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${finalFilename}-debug.txt`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -703,7 +716,7 @@ const App: React.FC = () => {
     <div className="min-h-screen flex flex-col items-center p-4 sm:p-8">
       <header className="w-full max-w-2xl mx-auto text-center mb-8">
         <h1 className="text-3xl font-bold text-slate-100 mb-2">_to-lithic: Multimedia Processor</h1>
-        <p className="text-slate-400">Upload document, image, or audio files to collate into a Monolith-friendly Streams-node layout.</p>
+        <p className="text-slate-400">Upload document, image, or audio files to collate into a Monolith-friendly layout.</p>
       </header>
 
       <main className="w-full flex-1">
@@ -724,25 +737,39 @@ const App: React.FC = () => {
                       Session Quota: {formatSize(totalSize)} / {formatSize(MAX_SESSION_SIZE)}
                   </p>
               </div>
-              <div className="w-full max-w-2xl mx-auto mt-3 flex items-center justify-end">
-                <input id="autostart-checkbox" type="checkbox" checked={autoStartProcessing} onChange={(e) => setAutoStartProcessing(e.target.checked)} disabled={isProcessing || isPreparing}
-                  className="h-4 w-4 rounded border-slate-500 bg-slate-700 text-indigo-500 focus:ring-indigo-600 focus:ring-offset-slate-900 disabled:opacity-50 disabled:cursor-not-allowed" />
-                <label htmlFor="autostart-checkbox" className={`ml-2 text-sm select-none ${isProcessing || isPreparing ? 'text-slate-500 cursor-not-allowed' : 'text-slate-300 cursor-pointer'}`}>
-                  Autostart processing after next upload
-                </label>
+              <div className="w-full max-w-2xl mx-auto mt-3 flex flex-col sm:flex-row items-end sm:items-center justify-end gap-3">
+                <div className="flex items-center">
+                  <input id="skip-refinement-checkbox" type="checkbox" checked={skipRefinement} onChange={(e) => setSkipRefinement(e.target.checked)} disabled={isProcessing || isPreparing}
+                    className="h-4 w-4 rounded border-slate-500 bg-slate-700 text-indigo-500 focus:ring-indigo-600 focus:ring-offset-slate-900 disabled:opacity-50 disabled:cursor-not-allowed" />
+                  <label htmlFor="skip-refinement-checkbox" className={`ml-2 text-sm select-none ${isProcessing || isPreparing ? 'text-slate-500 cursor-not-allowed' : 'text-slate-300 cursor-pointer'}`} title="Recommended for native EPUB/DOCX. Saves generation time by skipping AI transcription refinement.">
+                    Skip AI Refinement
+                  </label>
+                </div>
+                <div className="flex items-center">
+                  <input id="autostart-checkbox" type="checkbox" checked={autoStartProcessing} onChange={(e) => setAutoStartProcessing(e.target.checked)} disabled={isProcessing || isPreparing}
+                    className="h-4 w-4 rounded border-slate-500 bg-slate-700 text-indigo-500 focus:ring-indigo-600 focus:ring-offset-slate-900 disabled:opacity-50 disabled:cursor-not-allowed" />
+                  <label htmlFor="autostart-checkbox" className={`ml-2 text-sm select-none ${isProcessing || isPreparing ? 'text-slate-500 cursor-not-allowed' : 'text-slate-300 cursor-pointer'}`}>
+                    Autostart next upload
+                  </label>
+                </div>
               </div>
 
-              {isPreparing && <ProcessingLog logs={logs} />}
+              {(isPreparing || isGeneratingPrefix || isRefining) && (logs.length > 0 || refinementStreamContent) ? <ProcessingLog logs={logs} streamContent={isRefining ? refinementStreamContent : undefined} /> : null}
 
               {uploadedFiles.length > 0 && (
                 <div className="w-full max-w-2xl mx-auto mt-8 mb-6 text-center">
-                  <button onClick={handleProcessClick} disabled={pendingFilesCount === 0 || isProcessing || isPreparing || isRefining}
+                  <button onClick={handleProcessClick} disabled={pendingFilesCount === 0 || isProcessing || isPreparing || isRefining || isGeneratingPrefix}
                     className="inline-flex items-center justify-center px-8 py-3 text-base font-medium text-white bg-indigo-600 border border-transparent rounded-md shadow-sm hover:bg-indigo-700 disabled:bg-slate-600 disabled:cursor-not-allowed transition-colors">
                     {isProcessing ? (
                       <>
                         <SpinnerIcon className="w-5 h-5 mr-3" />
                         Processing...
                         {processingProgress.total > 0 && <span className="ml-2">({processingProgress.completed}/{processingProgress.total})</span>}
+                      </>
+                    ) : isGeneratingPrefix ? (
+                      <>
+                        <SpinnerIcon className="w-5 h-5 mr-3" />
+                        Generating Shortcode...
                       </>
                     ) : isRefining ? (
                       <>
@@ -754,19 +781,15 @@ const App: React.FC = () => {
                 </div>
               )}
 
-              {isRefining ? (
-                <RefinementPreview content={refinementStreamContent} />
-              ) : (
-                <FileList files={uploadedFiles} onReorder={setUploadedFiles} isProcessing={isProcessing || isRefining}
-                  onRemoveMultiple={handleRemoveMultipleFiles} onUpdateFile={handleUpdateFile}
-                  selectedIds={selectedIds} onSelectionChange={setSelectedIds} onOpenCropModal={handleOpenCropModal} />
-              )}
+              <FileList files={uploadedFiles} onReorder={setUploadedFiles} isProcessing={isProcessing || isRefining}
+                onRemoveMultiple={handleRemoveMultipleFiles} onUpdateFile={handleUpdateFile}
+                selectedIds={selectedIds} onSelectionChange={setSelectedIds} onOpenCropModal={handleOpenCropModal} />
             </>
           )}
 
         {markdown && !isRefining && (
           <ResultPreview markdown={markdown} lithicContent={lithicContent} assets={allAssets} onDownload={handleDownload} onClear={handleClear} onReprocess={handleReprocess}
-            filename={finalFilename} onFilenameChange={setFinalFilename} rawMarkdown={rawMarkdown} onDownloadRaw={handleDownloadRawMarkdown} />
+            filename={finalFilename} onFilenameChange={setFinalFilename} rawMarkdown={rawMarkdown} onDownloadMarkdown={handleDownloadMarkdown} onDownloadDebug={handleDownloadDebugPlaintext} />
         )}
       </main>
 
@@ -787,12 +810,24 @@ const App: React.FC = () => {
           />
       )}
 
+      {prefixPromptResolve && (
+          <PrefixPromptModal
+            onConfirm={(prefix) => {
+              prefixPromptResolve(prefix);
+              setPrefixPromptResolve(null);
+            }}
+            onCancel={() => {
+              prefixPromptResolve('DOC');
+              setPrefixPromptResolve(null);
+            }}
+          />
+      )}
+
       <footer className="w-full max-w-2xl mx-auto text-center mt-8">
         <p className="text-xs text-slate-500">
             Note: Files are processed in-browser and streamed directly to the API. Your files are not stored on any server.
         </p>
       </footer>
-      <ApiUsageCounter />
     </div>
   );
 };

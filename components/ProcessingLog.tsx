@@ -3,16 +3,17 @@ import React, { useEffect, useRef } from 'react';
 
 interface ProcessingLogProps {
   logs: string[];
+  streamContent?: string;
 }
 
-const ProcessingLog: React.FC<ProcessingLogProps> = ({ logs }) => {
+const ProcessingLog: React.FC<ProcessingLogProps> = ({ logs, streamContent }) => {
   const logContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
-  }, [logs]);
+  }, [logs, streamContent]);
 
   return (
     <div
@@ -27,6 +28,14 @@ const ProcessingLog: React.FC<ProcessingLogProps> = ({ logs }) => {
           <span className="text-indigo-400 mr-2 select-none">&gt;</span>{log}
         </p>
       ))}
+      {streamContent && (
+        <pre className="whitespace-pre-wrap break-words leading-relaxed mt-2 text-slate-300 font-mono text-xs">
+          <code>
+            {streamContent}
+            <span className="inline-block w-2 h-3 bg-green-400 animate-pulse ml-1 align-middle" aria-hidden="true"></span>
+          </code>
+        </pre>
+      )}
     </div>
   );
 };

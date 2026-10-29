@@ -13,7 +13,8 @@ interface ResultPreviewProps {
   filename: string;
   onFilenameChange: (newFilename: string) => void;
   rawMarkdown: string;
-  onDownloadRaw: () => void;
+  onDownloadMarkdown: () => void;
+  onDownloadDebug: () => void;
 }
 
 const ResultPreview: React.FC<ResultPreviewProps> = ({
@@ -26,7 +27,8 @@ const ResultPreview: React.FC<ResultPreviewProps> = ({
   filename,
   onFilenameChange,
   rawMarkdown,
-  onDownloadRaw,
+  onDownloadMarkdown,
+  onDownloadDebug,
 }) => {
   const [isCopied, setIsCopied] = useState(false);
   const [showLithic, setShowLithic] = useState(true);
@@ -83,15 +85,6 @@ const ResultPreview: React.FC<ResultPreviewProps> = ({
                 <ClipboardIcon className="w-5 h-5 mr-2" />
                 {isCopied ? 'Copied!' : 'Copy'}
             </button>
-            {rawMarkdown && (
-              <button
-                onClick={onDownloadRaw}
-                className="px-3 py-2 text-xs font-medium text-slate-400 bg-slate-700 rounded-md hover:bg-slate-600 hover:text-slate-300 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-indigo-500"
-                title="Download the raw, pre-refinement markdown file for debugging."
-              >
-                Download Debug MD
-              </button>
-            )}
             <button
               onClick={onReprocess}
               className="px-4 py-2 text-sm font-medium text-slate-300 bg-slate-700 rounded-md hover:bg-slate-600 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-indigo-500"
@@ -104,6 +97,15 @@ const ResultPreview: React.FC<ResultPreviewProps> = ({
             >
               Start Over
             </button>
+            {rawMarkdown && (
+                <button
+                  onClick={onDownloadDebug}
+                  className="px-4 py-2 text-sm font-medium text-slate-300 bg-slate-700 rounded-md hover:bg-slate-600 transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-indigo-500"
+                  title="Download Debug Plaintext"
+                >
+                  Download Debug Plaintext
+                </button>
+            )}
         </div>
       </div>
 
@@ -150,11 +152,20 @@ const ResultPreview: React.FC<ResultPreviewProps> = ({
                 </button>
             )}
             <button
+                onClick={onDownloadMarkdown}
+                className="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-white bg-slate-600 border border-transparent rounded-md shadow-sm hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-slate-500 h-10"
+                title="Download Markdown"
+            >
+                <DownloadIcon className="w-3.5 h-3.5 mr-1.5" />
+                *.md
+            </button>
+            <button
               onClick={onDownload}
               className="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-white bg-indigo-600 border border-transparent rounded-md shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-slate-900 focus:ring-indigo-500 h-10"
+              title="Download Lithic File"
             >
-              <DownloadIcon className="w-5 h-5 mr-2" />
-              Download Lithic
+              <DownloadIcon className="w-3.5 h-3.5 mr-1.5" />
+              *.lith
             </button>
         </div>
       </div>

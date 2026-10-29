@@ -20,12 +20,12 @@ export const processEpubFile = async (
         
         const originalName = epubFile.name.substring(0, epubFile.name.lastIndexOf('.')) || epubFile.name;
 
-        // Process sections from spine
-        let sectionCount = 0;
+        // Process pages from spine
+        let pageCount = 0;
         
         for (const item of (spine as any).items) {
-            sectionCount++;
-            addLog(`[${epubFile.name}] Processing section ${sectionCount}/${(spine as any).items.length}...`, true);
+            pageCount++;
+            addLog(`[${epubFile.name}] Processing page ${pageCount}/${(spine as any).items.length}...`, true);
             
             const doc = await book.load(item.href);
             if (doc) {
@@ -45,10 +45,11 @@ export const processEpubFile = async (
                                 if (resource) {
                                     const response = await fetch(resource);
                                     const blob = await response.blob();
-                                    const imageFile = new File([blob], `${originalName}-section${sectionCount}-img${imgIndex + 1}.png`, { type: blob.type });
+                                    const formattedPageCount = String(pageCount).padStart(3, '0');
+                                    const imageFile = new File([blob], `${originalName}-page${formattedPageCount}-img${imgIndex + 1}.png`, { type: blob.type });
                                     
                                     newFilesToQueue.push({
-                                        id: `${fileId}-epub-s${sectionCount}-i${imgIndex}`,
+                                        id: `${fileId}-epub-s${formattedPageCount}-i${imgIndex}`,
                                         file: imageFile,
                                         type: 'image',
                                         status: ProcessingStatus.PENDING,
@@ -58,7 +59,7 @@ export const processEpubFile = async (
                                     });
                                     
                                     // Replace img in text with a placeholder
-                                    const placeholder = `---IMAGE_BREAK_SECTION_${sectionCount}_INDEX_${imgIndex}---`;
+                                    const placeholder = `---IMAGE_BREAK_PAGE_${formattedPageCount}_INDEX_${imgIndex}---`;
                                     const placeholderNode = (doc as Document).createTextNode(placeholder);
                                     img.parentNode?.replaceChild(placeholderNode, img);
                                 }
@@ -71,11 +72,20 @@ export const processEpubFile = async (
 
                 await Promise.all(imagePromises);
 
+                const formattedPageCount = String(pageCount).padStart(3, '0');
                 const text = body.innerText || body.textContent || '';
-                if (text.trim()) {
-                    const textFile = new File([text.trim()], `${originalName}-section${sectionCount}.txt`, { type: 'text/plain' });
+                const fallbackTitle = '__FALLBACK_TITLE__';
+                const titleMatch = body.querySelector('h1, h2, h3, h4, h5, h6, title, div.title, p.title')?.textContent || fallbackTitle;
+                const sanitizedTitle = titleMatch === fallbackTitle 
+                    ? `Page_${formattedPageCount}` 
+                    : titleMatch.trim().replace(/\s+/g, '_');
+
+                if (text.trim() || images.length > 0) {
+                    // Prepend with ## so the lithic generator knows it's a new chapter
+                    const finalMarkdown = `## ${sanitizedTitle}\n\n${text.trim()}`;
+                    const textFile = new File([finalMarkdown], `${originalName}-page${formattedPageCount}.txt`, { type: 'text/plain' });
                     newFilesToQueue.push({
-                        id: `${fileId}-epub-s${sectionCount}-text`,
+                        id: `${fileId}-epub-s${formattedPageCount}-text`,
                         file: textFile,
                         type: 'text',
                         status: ProcessingStatus.PENDING,

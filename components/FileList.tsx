@@ -41,42 +41,73 @@ const StatusIndicator: React.FC<{ uploadedFile: UploadedFile }> = ({ uploadedFil
 
 const ProcessingPreview: React.FC<{ uploadedFile: UploadedFile }> = ({ uploadedFile }) => {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const lastPhaseRef = useRef<string>('');
+  const phaseStartTimeRef = useRef<number>(uploadedFile.processingStartTime || Date.now());
+
+  useEffect(() => {
+    const isWaitingPhase = uploadedFile.currentLogMessage?.trim().startsWith('Waiting on AI to process');
+    if (isWaitingPhase && lastPhaseRef.current !== 'waiting') {
+        lastPhaseRef.current = 'waiting';
+        phaseStartTimeRef.current = Date.now();
+    } else if (!uploadedFile.currentLogMessage && uploadedFile.status === ProcessingStatus.PROCESSING) {
+        // Fresh start
+        lastPhaseRef.current = 'uploading';
+        phaseStartTimeRef.current = uploadedFile.processingStartTime || Date.now();
+    }
+  }, [uploadedFile.currentLogMessage, uploadedFile.processingStartTime, uploadedFile.status]);
 
   useEffect(() => {
     let intervalId: number | undefined;
 
-    if (uploadedFile.status === ProcessingStatus.PROCESSING && uploadedFile.processingStartTime) {
-      const startTime = uploadedFile.processingStartTime;
-      
+    if (uploadedFile.status === ProcessingStatus.PROCESSING) {
       const updateElapsed = () => {
-          const seconds = Math.floor((Date.now() - startTime) / 1000);
+          const startTime = phaseStartTimeRef.current;
+          const seconds = Math.max(0, Math.floor((Date.now() - startTime) / 1000));
           setElapsedSeconds(seconds);
       };
       
-      updateElapsed(); // Set initial value immediately
+      updateElapsed();
       intervalId = window.setInterval(updateElapsed, 1000);
     } else {
         setElapsedSeconds(0);
+        lastPhaseRef.current = '';
     }
 
-    return () => {
-      if (intervalId) {
-        clearInterval(intervalId);
-      }
-    };
-  }, [uploadedFile.status, uploadedFile.processingStartTime]);
+    return () => clearInterval(intervalId);
+  }, [uploadedFile.status]);
   
   const defaultText = uploadedFile.type === 'audio' 
-    ? `Processing transcription... (${elapsedSeconds}s / ~30s-90s)` 
+    ? `Processing transcription... (${elapsedSeconds}s)` 
     : `Processing image... (${elapsedSeconds}s)`;
+
+  const statusText = uploadedFile.currentLogMessage ? `${uploadedFile.currentLogMessage} (${elapsedSeconds}s)` : defaultText;
+
+  let progressPercentage: number | null = null;
+  let displayText = statusText;
+  let asciiBar = '';
+  const progressMatch = statusText.match(/\[(\d+)%\]/);
+  if (progressMatch) {
+      progressPercentage = parseInt(progressMatch[1], 10);
+      displayText = statusText.replace(/\[\d+%\]/, '').trim();
+      const barLength = 25;
+      const filledLength = Math.floor((progressPercentage / 100) * barLength);
+      const emptyLength = barLength - filledLength;
+      const barConfig = '#'.repeat(filledLength) + '-'.repeat(emptyLength);
+      asciiBar = `[${barConfig}] ${progressPercentage}%`;
+  }
 
   return (
     <div className="mt-2 text-xs text-slate-400 bg-slate-900 p-2 rounded-md h-24 overflow-hidden font-mono border border-slate-700 flex flex-col justify-between">
-      {uploadedFile.retryingMessage ? (
-        <p className="text-yellow-400">{uploadedFile.retryingMessage}</p>
-      ) : (
-        <p className="text-slate-500">{defaultText}</p>
-      )}
+      <div>
+        {uploadedFile.retryingMessage ? (
+          <p className="text-yellow-400">{uploadedFile.retryingMessage}</p>
+        ) : (
+          <p className="text-slate-500">{displayText}</p>
+        )}
+        {progressPercentage !== null && (
+          <p className="text-indigo-400 mt-1">{asciiBar}</p>
+        )}
+      </div>
       <p className="whitespace-pre-wrap break-words text-right">
         {(uploadedFile.partialTranscription || '')
             .split('\n')
@@ -182,14 +213,9 @@ const ImageFileDetails: React.FC<{ uploadedFile: UploadedFile; onUpdateFile: (id
 };
 
 const AudioFileDetails: React.FC<{ uploadedFile: UploadedFile }> = ({ uploadedFile }) => {
-    const isFromVideo = uploadedFile.originalFileName && /\.(mp4|mov|webm|avi|mkv|flv|wmv)$/i.test(uploadedFile.originalFileName);
-
     return (
         <div className="flex items-center space-x-4 flex-1 min-w-0">
-            {isFromVideo
-                ? <FileVideoIcon className="w-6 h-6 text-slate-400 flex-shrink-0" />
-                : <FileAudioIcon className="w-6 h-6 text-slate-400 flex-shrink-0" />
-            }
+            <FileAudioIcon className="w-6 h-6 text-slate-400 flex-shrink-0" />
             <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium text-slate-200 truncate" title={uploadedFile.file.name}>
                     {uploadedFile.originalFileName && typeof uploadedFile.chunkIndex !== 'undefined' && uploadedFile.totalChunks
@@ -314,7 +340,7 @@ const FileList: React.FC<FileListProps> = ({ files, onReorder, isProcessing, onR
   return (
     <div className="w-full max-w-2xl mx-auto">
       <div className="flex justify-between items-center mb-3">
-        <h2 className="text-lg font-semibold text-slate-300">File Queue</h2>
+        <h2 className="text-lg font-semibold text-slate-300">Chunk Queue</h2>
         {selectedIds.size > 0 && !isProcessing && (
             <button
                 onClick={handleDeleteSelected}

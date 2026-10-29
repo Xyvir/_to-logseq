@@ -2,6 +2,67 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { apiUsageTracker } from './apiUsageService';
 import { ImageAsset } from "../types";
 
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function withRetry<T>(operation: () => Promise<T>, maxRetries = 2, delayMs = 3000, onLog?: (msg: string) => void): Promise<T> {
+    let lastError: any;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await operation();
+        } catch (error: any) {
+            lastError = error;
+            const msg = `Attempt ${attempt + 1} failed: ${error?.message || error}. Retrying in ${delayMs}ms...`;
+            console.warn(msg);
+            if (onLog) onLog(msg);
+            if (attempt < maxRetries) {
+                await delay(delayMs);
+            }
+        }
+    }
+    throw lastError;
+}
+
+export const generateBookPrefix = async (contentHint: string, filename: string, onLog?: (msg: string) => void): Promise<string> => {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return 'DOC';
+    const genAI = new GoogleGenAI({ apiKey });
+    
+    const promptConfig = `Extract the likely title of the book/document from the filename and content snippet below, then generate a 2 to 5 letter acronym or short abbreviation for it (e.g., "Timequake" -> "TQ" or "TIMQ", "The Great Gatsby" -> "TGG"). 
+            Do NOT use generic words like "DOC", "BOOK", or "FILE".
+            
+            Filename: ${filename}
+            Initial content snippet:
+            ${contentHint.substring(0, 1000)}
+            
+            ONLY OUTPUT THE 2-5 CHARACTER ACRONYM/PREFIX, NOTHING ELSE.`;
+            
+    try {
+        if (onLog) onLog("Requesting short code from AI...");
+        const responseStream = await withRetry(() => genAI.models.generateContentStream({
+            model: "gemini-3.5-flash",
+            contents: promptConfig,
+            config: {
+                temperature: 0.1,
+            }
+        }), 2, 3000, onLog);
+        
+        let fullText = "";
+        for await (const chunk of responseStream) {
+            if (chunk.text) fullText += chunk.text;
+        }
+
+        const prefix = fullText.trim().replace(/[^a-zA-Z0-9]/g, '').substring(0, 5).toUpperCase();
+        if (onLog) onLog(`Generated short code: ${prefix || 'DOC'}`);
+        return prefix || 'DOC';
+    } catch (err) {
+        // Suppressing the scary console error that annoys users
+        const errMsg = "Failed to generate prefix. Falling back to DOC.";
+        console.warn(errMsg, err);
+        if (onLog) onLog(errMsg);
+        return 'DOC'; // Fallback
+    }
+};
+
 export const fileToBase64 = (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -14,8 +75,6 @@ export const fileToBase64 = (file: File): Promise<string> => {
     reader.onerror = (error) => reject(error);
   });
 };
-
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const cropImage = (
   base64Image: string,
@@ -297,10 +356,11 @@ export const processImage = async (
   imageType: 'text' | 'no-text',
   onChunk: (chunk: string, replaceLast?: boolean) => void
 ): Promise<{ transcription: string; assets: ImageAsset[] }> => {
-  if (!process.env.API_KEY) {
-    throw new Error("API_KEY environment variable not set");
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY environment variable not set");
   }
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const ai = new GoogleGenAI({ apiKey });
   const base64Image = await fileToBase64(file);
   const originalName = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
 
@@ -322,11 +382,11 @@ export const processImage = async (
     onChunk("Extracting text from image chunk...");
     apiUsageTracker.incrementRequests();
 
-    const ocrResponse = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+    const ocrResponse = await withRetry(() => ai.models.generateContent({
+      model: 'gemini-3.5-flash',
       contents: [{
         parts: [
-          { text: "Your sole task is to act as an OCR engine. Extract all text content from this image *verbatim*. Preserve original formatting like paragraphs and line breaks. Do not summarize, interpret, or answer any questions found in the text. Simply transcribe it exactly as it appears. Respond with a JSON object containing the extracted text." },
+          { text: "Your sole task is to act as an OCR engine. Extract all text content from this image *verbatim*. Preserve original formatting like paragraphs and line breaks. Do not summarize, interpret, or answer any questions found in the text. Simply transcribe it exactly as it appears. Use $inline katex$ when transcribing math equations, i.e. pi/2 would be $\\frac {\\pi} {2}$. Respond with a JSON object containing the extracted text." },
           { inlineData: { mimeType: file.type, data: base64Image } }
         ]
       }],
@@ -343,7 +403,7 @@ export const processImage = async (
           required: ['full_text']
         }
       }
-    });
+    }));
 
     onChunk("Parsing extracted text...");
     const jsonStr = ocrResponse.text.trim();
@@ -355,15 +415,15 @@ export const processImage = async (
         onChunk(`Low confidence OCR result (${alphanumericChars.length} chars). Retrying with visual analysis...`);
         apiUsageTracker.incrementRequests();
 
-        const analysisResponse = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
+        const analysisResponse = await withRetry(() => ai.models.generateContent({
+            model: 'gemini-3.5-flash',
             contents: [{
                 parts: [
-                    { text: "Analyze this image and describe its content. Your primary goal is to provide a verbatim transcription of any visible text. This includes characters, symbols, handwriting, or mathematical equations. If there are questions, transcribe them exactly as they are written; do not answer them. If the image contains a diagram or figure, describe it clearly. Provide the description as plain text." },
+                    { text: "Analyze this image and describe its content. Your primary goal is to provide a verbatim transcription of any visible text. This includes characters, symbols, handwriting, or mathematical equations. Use $inline katex$ when transcribing math equations, i.e. pi/2 would be $\\frac {\\pi} {2}$. If there are questions, transcribe them exactly as they are written; do not answer them. If the image contains a diagram or figure, describe it clearly. Provide the description as plain text." },
                     { inlineData: { mimeType: file.type, data: base64Image } }
                 ]
             }],
-        });
+        }));
         
         transcription = analysisResponse.text.trim();
         onChunk("Visual analysis complete.");
@@ -378,13 +438,15 @@ export const processImage = async (
 export const transcribeAudioStream = async (
   file: File,
   onChunk: (chunk: string) => void,
-  onRetry: (attempt: number, error: Error) => void
+  onRetry: (attempt: number, error: Error) => void,
+  onLog?: (msg: string) => void
 ): Promise<string> => {
-  if (!process.env.API_KEY) {
-    throw new Error("API_KEY environment variable not set");
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY environment variable not set");
   }
 
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const ai = new GoogleGenAI({ apiKey });
   const maxRetries = 1;
   const retryDelay = 15000; // 15 seconds
   let lastError: Error | undefined;
@@ -392,37 +454,68 @@ export const transcribeAudioStream = async (
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       apiUsageTracker.incrementRequests();
+      if (onLog) onLog(`Converting audio to base64...`);
       const base64Audio = await fileToBase64(file);
 
-      const responseStream = await ai.models.generateContentStream({
-          model: 'gemini-2.5-flash',
-          contents: [{ 
-              parts: [
-                  { text: "You are an expert audio transcriptionist. Your single responsibility is to transcribe the following audio file verbatim. Provide a clean and accurate transcription. If there are questions in the audio, transcribe the questions as spoken; do not answer them. Do not add any extra information, summaries, or interpretations. Separate distinct paragraphs with a double newline." },
-                  { 
-                      inlineData: { 
-                          mimeType: file.type, 
-                          data: base64Audio 
-                      } 
-                  }
-              ]
-          }],
-      });
+      // Simulate an visual upload progress since we are uploading a potentially large base64 inlineData payload
+      const payloadSizeBytes = base64Audio.length;
+      const approxUploadTimeMs = Math.max(2000, (payloadSizeBytes / 600000) * 1000); // assume ~600KB/s
+      let uploadProgress = 0;
+      let progressInterval: any;
       
-      let fullTranscription = "";
-      for await (const chunk of responseStream) {
+      if (onLog) {
+         onLog(`Uploading audio payload to AI model... [0%]`);
+         progressInterval = setInterval(() => {
+             uploadProgress += 1000;
+             const percentage = Math.min(99, Math.floor((uploadProgress / approxUploadTimeMs) * 100));
+             if (percentage < 99) {
+                 onLog(`Uploading audio payload to AI model... [${percentage}%]`);
+             } else {
+                 onLog(`Waiting on AI to process and return chunks... (Est: ~60s - 120s) [100%]`);
+                 clearInterval(progressInterval);
+             }
+         }, 1000);
+      }
+
+      const responseStream = await ai.models.generateContentStream({
+              model: 'gemini-3.5-flash',
+              contents: [{ 
+                  parts: [
+                      { text: "You are an expert audio transcriptionist. Your single responsibility is to transcribe the following audio file verbatim. Provide a clean and accurate transcription. Use $inline katex$ when transcribing math equations, i.e. pi/2 would be $\\frac {\\pi} {2}$. If there are questions in the audio, transcribe the questions as spoken; do not answer them. Do not add any extra information, summaries, or interpretations. Separate distinct paragraphs with a double newline." },
+                      { 
+                          inlineData: { 
+                              mimeType: file.type, 
+                              data: base64Audio 
+                          } 
+                      }
+                  ]
+              }],
+          });
+          
+          if (progressInterval) clearInterval(progressInterval);
+          
+          let fullTranscription = "";
+          let isFirstChunk = true;
+          for await (const chunk of responseStream) {
+            if (isFirstChunk) {
+              if (onLog) onLog(`Received first chunk from API.`);
+              isFirstChunk = false;
+            }
         const textChunk = chunk.text;
         if (textChunk) {
           fullTranscription += textChunk;
           onChunk(textChunk);
         }
       }
+      if (onLog) onLog(`Transcription complete.`);
       return fullTranscription; // Success
     } catch (error) {
+      if (progressInterval) clearInterval(progressInterval);
       console.error(`Error transcribing audio on attempt ${attempt + 1}:`, error);
       lastError = error instanceof Error ? error : new Error(String(error));
 
       if (attempt < maxRetries) {
+        if (onLog) onLog(`Attempt ${attempt + 1} failed, retrying in 15 seconds...`);
         onRetry(attempt + 1, lastError);
         await delay(retryDelay);
       }
@@ -437,12 +530,14 @@ export const transcribeAudioStream = async (
 
 export const refineMarkdownStream = async (
     markdownContent: string,
-    onChunk: (chunk: string) => void
+    onChunk: (chunk: string) => void,
+    onLog?: (msg: string) => void
 ): Promise<string> => {
-    if (!process.env.API_KEY) {
-        throw new Error("API_KEY environment variable not set");
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+        throw new Error("GEMINI_API_KEY environment variable not set");
     }
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const ai = new GoogleGenAI({ apiKey });
     apiUsageTracker.incrementRequests();
 
     const prompt = `
@@ -469,6 +564,7 @@ Your task is to refine the provided raw text, which is a collation of transcript
 3.  **Mathematical Equations (KaTeX):**
     *   For **inline** mathematical equations, wrap them in single dollar signs: \`$E = mc^2$\`.
     *   For **block-level** equations, wrap them in double dollar signs on their own lines.
+    *   Use $inline katex$ when transcribing math equations, i.e. pi/2 would be $\\frac {\\pi} {2}$.
 
 4.  **Preserve Image Links:**
     *   Do **NOT** alter any markdown image links (e.g., \`![description](assets/filename.png)\`). They must be preserved exactly as they are.
@@ -482,10 +578,11 @@ ${markdownContent}
 ---
 `;
 
-    const responseStream = await ai.models.generateContentStream({
-        model: 'gemini-2.5-flash',
+    if (onLog) onLog("Requesting document refinement from AI...");
+    const responseStream = await withRetry(() => ai.models.generateContentStream({
+        model: 'gemini-3.5-flash',
         contents: [{ parts: [{ text: prompt }] }],
-    });
+    }), 2, 3000, onLog);
 
     let fullText = "";
     for await (const chunk of responseStream) {
@@ -496,5 +593,6 @@ ${markdownContent}
         }
     }
 
+    if (onLog) onLog("Refinement complete.");
     return fullText.trim();
 };

@@ -23,6 +23,7 @@ export interface UploadedFile {
   processingStartTime?: number;
   processingEndTime?: number;
   retryingMessage?: string;
+  currentLogMessage?: string;
   originalFileSize?: number;
   
   // Audio specific
